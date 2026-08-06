@@ -158,11 +158,18 @@ TV_RISK = {
 # the default), so the cap lives here instead: the bot trades a NOTIONAL book of
 # QUANT_CAPITAL that starts at this value and then moves with the account's real PnL.
 # Set it to whatever you intend to trade for real, so the demo is a true rehearsal.
-BYBIT_CAPITAL = float(os.environ.get("QUANT_CAPITAL", "200"))
+# QUANT_CAPITAL="full" (or unset) => the bot manages the WHOLE account balance and
+# sizes off it directly. A number => it trades a notional book of that size instead,
+# which is what you want to rehearse a smaller account on a big demo balance.
+_cap = os.environ.get("QUANT_CAPITAL", "full").strip().lower()
+BYBIT_CAPITAL = None if _cap in ("full", "", "0", "auto") else float(_cap)
 
 BYBIT_RISK = {
     "max_risk_per_trade_pct": 4.0,
-    "max_concurrent_positions": 3,
+    # Raised 3 -> 8 alongside the 24 -> 59 coin universe: with more markets scanned,
+    # good setups cluster, and a cap of 3 would silently drop most of them. At ~1% risk
+    # per trade this still caps total risk at roughly 8% of the account.
+    "max_concurrent_positions": 8,
     "max_daily_drawdown_pct": 6.0,    # real money: halt the day much sooner
     "default_leverage": 5,
     "max_loss_usd": 0.80,
@@ -239,8 +246,10 @@ class QuantRunner:
         # On a fresh account (reset to $12) this becomes 12, so pnl reads correctly.
         # In Bybit mode the notional book always starts at BYBIT_CAPITAL — reading the
         # persisted start would inherit the $12 TradingView anchor and report nonsense PnL.
-        self.start_equity = (BYBIT_CAPITAL if mode == "bybit"
-                             else self._load_start_equity(self.equity))
+        # In Bybit mode PnL is measured from where this book started: the configured
+        # capital, or (running the whole account) the balance we first saw.
+        self.start_equity = ((BYBIT_CAPITAL if BYBIT_CAPITAL is not None else self._real_start)
+                             if mode == "bybit" else self._load_start_equity(self.equity))
         self.running = False
         self._thread: threading.Thread | None = None
         self.last_tick = None
@@ -276,11 +285,17 @@ class QuantRunner:
         return current
 
     def _book_equity(self) -> float:
-        """The account the bot THINKS it is trading: starts at BYBIT_CAPITAL and moves
-        one-for-one with the exchange account's real profit and loss. Sizing, the
-        exposure cap and the daily kill-switch all run off this, so they behave exactly
-        as they would on a real account of that size — while the balance shown by the
-        exchange stays the honest, untouched truth."""
+        """The account the bot sizes against.
+
+        BYBIT_CAPITAL is None -> the bot runs the WHOLE account: book equity IS the
+        exchange balance. This is the normal mode.
+
+        BYBIT_CAPITAL set -> a notional book of that size that starts there and then
+        moves one-for-one with the account's real PnL. Used to rehearse a small account
+        on a large demo balance; the exchange balance stays the untouched truth.
+        """
+        if BYBIT_CAPITAL is None:
+            return round(self.real_equity, 4)
         return round(BYBIT_CAPITAL + (self.real_equity - self._real_start), 4)
 
     def _load_start_equity(self, default: float) -> float:
@@ -329,7 +344,9 @@ class QuantRunner:
             "orphan_positions": sorted(self._orphans),
             # Keep the two numbers distinct and both visible: what the bot trades as,
             # and what the exchange actually holds.
-            "trading_capital": BYBIT_CAPITAL if self.mode == "bybit" else None,
+            "trading_capital": (BYBIT_CAPITAL if BYBIT_CAPITAL is not None
+                                else round(self.real_equity, 2)) if self.mode == "bybit" else None,
+            "manages_full_account": self.mode == "bybit" and BYBIT_CAPITAL is None,
             "real_balance": round(self.real_equity, 2) if self.mode == "bybit" else None,
             "bybit_real_start": self._real_start if self.mode == "bybit" else None,
         }
@@ -587,7 +604,8 @@ class QuantRunner:
         natural_rr = abs(sig.target - price) / stop_d0 if stop_d0 else 0.0
         plan = conviction.assess(prob=prob, adx=float(feats.iloc[-1]["adx14"]),
                                  natural_rr=natural_rr, side=sig.side,
-                                 entry=price, stop=sig.stop, fwd_agree=fwd_agree)
+                                 entry=price, stop=sig.stop, fwd_agree=fwd_agree,
+                                 equity=self.equity)
 
         decision = self.risk.evaluate(side=sig.side, entry=price, stop=plan.stop,
                                       open_positions=journal.open_positions(),

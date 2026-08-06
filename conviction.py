@@ -22,8 +22,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# --- tunables (a small account that wants $1+ wins with a limited loss) ---
-RISK_MIN, RISK_MAX = 0.55, 0.80    # $ risked per trade: marginal -> high conviction
+# --- tunables ---
+# Risk per trade is a PERCENTAGE of equity, not a fixed number of dollars. The old
+# fixed $0.55-$0.80 was tuned for a $12 account; on a $50,000 account that is 0.0016%
+# per trade — the bot would be "running" while risking nothing and compounding nothing.
+# A percentage scales with the account in both directions: it grows the size as the
+# account grows, and shrinks it after a drawdown, which is the behaviour that keeps a
+# losing streak survivable.
+#
+# 0.5% -> 1.0% of equity, marginal -> high conviction. At 0.5% risk, twenty consecutive
+# losses cost about 10% of the account; that is a bad month, not a dead account.
+RISK_PCT_MIN, RISK_PCT_MAX = 0.005, 0.010
+# Floor in dollars, for accounts too small for the percentage to clear the exchange's
+# minimum order value. Ceiling is a hard stop against a fat-fingered equity read.
+RISK_FLOOR_USD, RISK_CEIL_USD = 0.55, 500.0
+RISK_MIN, RISK_MAX = 0.55, 0.80    # legacy fixed band, used only if equity is unknown
 RR_MIN, RR_MAX = 1.85, 3.0         # take-profit reward:risk: marginal -> high conviction
 STOP_TIGHTEN = 0.20                # up to 20% tighter stop at max conviction (more qty, same $ risk)
 MIN_WIN = 1.0                      # never PLAN a winner below $1 (user's floor)
@@ -60,7 +73,8 @@ def score(prob: float, adx: float, natural_rr: float) -> float:
 
 
 def assess(*, prob: float, adx: float, natural_rr: float,
-           side: int, entry: float, stop: float, fwd_agree: float = 0.0) -> Plan:
+           side: int, entry: float, stop: float, fwd_agree: float = 0.0,
+           equity: float | None = None) -> Plan:
     """Turn a raw signal into a conviction-sized plan (qty $, stop, target).
 
     `fwd_agree` is the forward-looking evidence already SIGNED for this trade's
@@ -70,9 +84,16 @@ def assess(*, prob: float, adx: float, natural_rr: float,
     """
     c = _clip01(score(prob, adx, natural_rr) + W_FWD * max(-1.0, min(1.0, fwd_agree)))
 
-    risk_usd = RISK_MIN + c * (RISK_MAX - RISK_MIN)
+    if equity and equity > 0:
+        pct = RISK_PCT_MIN + c * (RISK_PCT_MAX - RISK_PCT_MIN)
+        risk_usd = min(max(equity * pct, RISK_FLOOR_USD), RISK_CEIL_USD)
+    else:
+        risk_usd = RISK_MIN + c * (RISK_MAX - RISK_MIN)
     rr = RR_MIN + c * (RR_MAX - RR_MIN)
-    rr = max(rr, MIN_WIN / risk_usd)               # guarantee the PLANNED win >= $1
+    # The $1 minimum-win floor only makes sense on a tiny account. On a real balance
+    # the percentage sizing already dwarfs it, and forcing it would distort the target.
+    if risk_usd < 2.0:
+        rr = max(rr, MIN_WIN / risk_usd)           # guarantee the PLANNED win >= $1
 
     stop_dist = abs(entry - stop)
     stop_dist_adj = stop_dist * (1.0 - STOP_TIGHTEN * c)   # tighter when confident

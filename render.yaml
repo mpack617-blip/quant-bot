@@ -21,10 +21,15 @@ services:
     envVars:
       - key: QUANT_MODE
         value: bybit
+      # "full" = the bot manages the whole account balance and sizes off it.
+      # Put a number here instead to rehearse a smaller account on a big balance.
       - key: QUANT_CAPITAL
-        value: "200"
+        value: full
+      # 300s, not 180s: the universe grew 24 -> 59 coins and Render's free instance is
+      # 0.1 CPU, so a full scan takes minutes. A period shorter than a scan just stacks
+      # ticks on top of each other.
       - key: QUANT_PERIOD
-        value: "180"
+        value: "300"
       - key: QUANT_NOBROWSER      # never try to open a browser on a server
         value: "1"
       - key: BYBIT_ENV

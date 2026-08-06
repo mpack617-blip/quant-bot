@@ -28,15 +28,48 @@ INTERVALS = {
 # The runner refuses any non-crypto symbol; only *USDT crypto pairs are traded.
 ASSET_CLASS = "crypto"
 
+# Bybit now lists TOKENISED STOCKS AND COMMODITIES as USDT perps — SNDKUSDT is
+# SanDisk, SOXLUSDT an ETF, XAUUSDT gold, TSLAUSDT/NVDAUSDT/QQQUSDT equities. Several
+# sit near the TOP of the 24h turnover table, so any "most liquid USDT perps" scan
+# picks them up. They end in USDT, so the old suffix check happily called them crypto.
+#
+# They must not be traded here: the user locked this bot to crypto, the strategies and
+# ML models were fitted on crypto behaviour, and news.py reads crypto-only RSS — a
+# stock would be traded on sentiment that has nothing to do with it. Equities also
+# have market hours and gaps that the 24/7 assumptions break on.
+#
+# Whitelisting is the safe direction: UNIVERSE is hand-curated, and this blocklist is
+# the second line of defence for anything added later.
+NON_CRYPTO = {
+    # US equities / semis
+    "SNDK", "MU", "NVDA", "INTC", "MRVL", "TSLA", "GOOGL", "MSTR", "AAOI", "NBIS",
+    "SKHYNIX", "SKHY", "SAMSUNG", "CRCL", "RDW", "HEI", "SPCX", "DRAM", "MUU",
+    # ETFs / indices
+    "SOXL", "SOXS", "QQQ", "EWY", "SNXX", "KORU", "CYS", "HFT",
+    # commodities (incl. tokenised metal + oil)
+    "XAU", "XAG", "XAUT", "PAXG", "CL", "BZ",
+}
+
+
 def is_crypto_symbol(sym: str) -> bool:
-    return sym.upper().replace("BINANCE:", "").endswith(("USDT", "USD"))
+    s = sym.upper().replace("BINANCE:", "")
+    if not s.endswith(("USDT", "USD")):
+        return False
+    base = s.removesuffix("USDT").removesuffix("USD")
+    return base not in NON_CRYPTO
 
 # Universe of liquid USDT crypto perps to scan (extend freely — crypto only)
 UNIVERSE = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT",
-    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "BCHUSDT",
-    "ATOMUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT", "INJUSDT",
-    "NEARUSDT", "TIAUSDT", "SEIUSDT", "FILUSDT", "UNIUSDT", "AAVEUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "HYPEUSDT", "ZECUSDT",
+    "DOGEUSDT", "ADAUSDT", "NEARUSDT", "ENAUSDT", "1000PEPEUSDT", "UNIUSDT",
+    "SUIUSDT", "BNBUSDT", "ONDOUSDT", "WLDUSDT", "AAVEUSDT", "LINKUSDT",
+    "AVAXUSDT", "XLMUSDT", "TAOUSDT", "1000RATSUSDT", "BICOUSDT", "FARTCOINUSDT",
+    "COTIUSDT", "PENGUUSDT", "BCHUSDT", "ARBUSDT", "INJUSDT", "KAITOUSDT",
+    "LTCUSDT", "WIFUSDT", "APTUSDT", "XMRUSDT", "LDOUSDT", "DOTUSDT",
+    "VIRTUALUSDT", "HBARUSDT", "OPUSDT", "TRUMPUSDT", "TRXUSDT", "FILUSDT",
+    "1000BONKUSDT", "TIAUSDT", "ETCUSDT", "CRVUSDT", "AXSUSDT", "DEXEUSDT",
+    "VANRYUSDT", "ATOMUSDT", "FIDAUSDT", "RENDERUSDT", "ZROUSDT", "ORDIUSDT",
+    "ALGOUSDT", "JUPUSDT", "STRKUSDT", "SEIUSDT", "DASHUSDT",
 ]
 
 # --- Risk defaults (used by risk manager later) ---
