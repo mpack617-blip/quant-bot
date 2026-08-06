@@ -1,0 +1,6 @@
+' Quant-Bot 24/7 auto-start (runs at Windows logon, no admin needed).
+' Launches the bot launcher hidden: opens TradingView with CDP, then the bot
+' (which analyses + trades on its own) and keeps it alive.
+' To disable auto-start, just delete this file from the Startup folder.
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File ""D:\Trader Bot\quant-bot\start_24x7.ps1""", 0, False

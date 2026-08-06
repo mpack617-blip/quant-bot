@@ -1,0 +1,371 @@
+{
+  "updated": "2026-08-06T11:30:47+00:00",
+  "running": false,
+  "equity": 200.0,
+  "start_equity": 200.0,
+  "pnl": 0.0,
+  "daily_dd_pct": 0.0,
+  "halted": false,
+  "open_positions": [
+    {
+      "id": 2,
+      "symbol": "OPUSDT",
+      "side": 1,
+      "entry": 0.08673,
+      "qty": 786.7,
+      "stop": 0.08591624354921472,
+      "target": 0.08857304895468053,
+      "opened_utc": "2026-08-06T11:30:07.703396+00:00",
+      "reason": "RANGEFADE LONG: lower-band reject, RSI 36, ADX 16 (range) | conv 0.36 rr 2.26 | ML p=0.60 | fwd UNCLEAR 52%/1h (agree +0.05) | news neutral/thin",
+      "context": "{\"ret1\": 0.001501328097932797, \"ret6\": -0.012300683371298415, \"ret24\": -0.012750455373406133, \"dist_ema20_pct\": -0.8088461721421414, \"dist_ema50_pct\": -1.1649654934061227, \"rsi14\": 35.78414721613656, \"atr_pct\": 0.5160622224901457, \"adx14\": 16.155931198253526, \"macd_hist\": -0.00011191461571135461, \"bb_pos\": 0.0946410734807168, \"vol20\": 0.002998703624151756, \"stoch_k\": 16.34615384615419}",
+      "venue": "bybit"
+    }
+  ],
+  "stats": {
+    "trades": 1,
+    "win_rate_pct": 0.0,
+    "net_pnl": -0.74,
+    "profit_factor": 0.0
+  },
+  "market_sentiment": {
+    "score": -0.07,
+    "risk_off": false,
+    "n": 75
+  },
+  "market_bias": "BTC UP",
+  "headlines": [
+    {
+      "title": "Why Sandisk and Western Digital crashed 10% and what it means for bitcoin",
+      "score": -1,
+      "tag": "bear"
+    },
+    {
+      "title": "JPYC raises $38 million Series B led by major Japanese logistics firm AZ-COM Maruwa",
+      "score": 0,
+      "tag": "neutral"
+    },
+    {
+      "title": "Bitcoin, ether benefit as traders seek safety of largest tokens",
+      "score": 0,
+      "tag": "neutral"
+    },
+    {
+      "title": "NFT startup founder charged with misusing funds from $10 million fundraising",
+      "score": 0,
+      "tag": "neutral"
+    },
+    {
+      "title": "Live updates: Coinbase lets UK users trade U.S. equities. BTC trades near $65,000",
+      "score": 0,
+      "tag": "neutral"
+    },
+    {
+      "title": "Bitcoin developers flag 85 critical bugs in an \"extremely bad\" situation",
+      "score": 0,
+      "tag": "neutral"
+    },
+    {
+      "title": "S&P 500 has added crypto's $2 trillion market cap this month. Bitcoin is not impressed. Here's why",
+      "score": 0,
+      "tag": "neutral"
+    },
+    {
+      "title": "Bitcoin steadies above $64,000 as traders watch $100 billion SpaceX unlock",
+      "score": 0,
+      "tag": "neutral"
+    }
+  ],
+  "watching": [
+    {
+      "symbol": "AAVE",
+      "regime": "STRONG DOWN",
+      "rsi": 33.0,
+      "adx": 30.0,
+      "signal": "SHORT",
+      "ml": 0.4,
+      "setup": "CONT SHORT",
+      "score": 80
+    },
+    {
+      "symbol": "ARB",
+      "regime": "STRONG DOWN",
+      "rsi": 22.0,
+      "adx": 32.0,
+      "signal": "SHORT",
+      "ml": 0.28,
+      "setup": "CONT SHORT",
+      "score": 39
+    },
+    {
+      "symbol": "INJ",
+      "regime": "STRONG DOWN",
+      "rsi": 26.0,
+      "adx": 31.0,
+      "signal": "SHORT",
+      "ml": 0.48,
+      "setup": "CONT SHORT",
+      "score": 38
+    },
+    {
+      "symbol": "OP",
+      "regime": "CHOP",
+      "rsi": 38.0,
+      "adx": 12.0,
+      "signal": "LONG",
+      "ml": 0.6,
+      "setup": "RANGEFADE LONG",
+      "score": 32
+    },
+    {
+      "symbol": "AVAX",
+      "regime": "CHOP",
+      "rsi": 20.0,
+      "adx": 16.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 57
+    },
+    {
+      "symbol": "XRP",
+      "regime": "DOWN",
+      "rsi": 39.0,
+      "adx": 26.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 47
+    },
+    {
+      "symbol": "BTC",
+      "regime": "UP",
+      "rsi": 51.0,
+      "adx": 27.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 40
+    },
+    {
+      "symbol": "LINK",
+      "regime": "CHOP",
+      "rsi": 39.0,
+      "adx": 13.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 37
+    },
+    {
+      "symbol": "SEI",
+      "regime": "CHOP",
+      "rsi": 40.0,
+      "adx": 16.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 37
+    },
+    {
+      "symbol": "ETH",
+      "regime": "UP",
+      "rsi": 52.0,
+      "adx": 22.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 36
+    },
+    {
+      "symbol": "DOGE",
+      "regime": "CHOP",
+      "rsi": 33.0,
+      "adx": 14.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 35
+    },
+    {
+      "symbol": "NEAR",
+      "regime": "DOWN",
+      "rsi": 37.0,
+      "adx": 18.0,
+      "signal": null,
+      "ml": null,
+      "setup": null,
+      "score": 35
+    }
+  ],
+  "activity": [
+    "11:30:47  scanned 24 crypto coins | BTC UP | news -0.07 (75 headlines) | evaluating signals | next move: AVAX UP 53.3% in 1h",
+    "11:30:33  SIGNAL CONT SHORT AAVE (ADX 30, RSI 33, ML 0.4)",
+    "11:30:10  SIGNAL CONT SHORT INJ (ADX 31, RSI 26, ML 0.48)",
+    "11:30:02  SIGNAL RANGEFADE LONG OP (ADX 12, RSI 38, ML 0.6)",
+    "11:30:01  SIGNAL CONT SHORT ARB (ADX 32, RSI 22, ML 0.28)"
+  ],
+  "scans": 1,
+  "learning": {
+    "live_trades_logged": 1,
+    "model_active": true,
+    "lessons_count": 1
+  },
+  "lessons": [
+    "2026-08-06T10:02 DOTUSDT: weak trend (ADX 24) \u2014 chop risk, prefer ADX>25"
+  ],
+  "last_note": "OPEN LONG OPUSDT @ 0.0867 qty 786.7 stop 0.0859 tgt 0.0886 (conv 0.36, risk $0.64 -> ~$1.45 win, ML 0.60)",
+  "tv_view": {},
+  "mode": "bybit",
+  "exchange": {
+    "env": "demo",
+    "host": "https://api-demo.bybit.com",
+    "keys": true,
+    "public": true,
+    "authenticated": true,
+    "equity": 49999.25299249,
+    "available": 49999.25299249,
+    "open_positions": 0
+  },
+  "forecasts": [
+    {
+      "symbol": "AVAX",
+      "direction": "UP",
+      "prob": 53.3,
+      "prob_up": 53.3,
+      "move_pct": -0.34,
+      "horizon": "1h",
+      "confidence": 0.09,
+      "ms_bias": 0.187,
+      "reasons": [
+        "model: 53% up over 1h, expected -0.34% [ADX 41 (trending), RSI 28, 1.5% below EMA20]",
+        "OI: longs liquidated out (price -2.65%, OI -4.25%) - capitulation, bounce risk",
+        "funding: funding normal (-0.0051%/8h) - no crowd extreme",
+        "flow: buyers aggressive (19% net of $132,313 taker vol)"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "ARB",
+      "direction": "DOWN",
+      "prob": 53.1,
+      "prob_up": 46.9,
+      "move_pct": -0.08,
+      "horizon": "1h",
+      "confidence": 0.08,
+      "ms_bias": -0.3,
+      "reasons": [
+        "model: 47% up over 1h, expected -0.08% [ADX 46 (trending), RSI 27, 1.2% below EMA20]",
+        "OI: new shorts entering (price -0.64%, OI +0.02%) - downtrend has fuel",
+        "funding: funding normal (0.0063%/8h) - no crowd extreme",
+        "book: asks thicker by 38% within 0.5% of mid"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "LINK",
+      "direction": "UNCLEAR",
+      "prob": 52.6,
+      "prob_up": 47.4,
+      "move_pct": -0.1,
+      "horizon": "1h",
+      "confidence": 0.07,
+      "ms_bias": -0.212,
+      "reasons": [
+        "model: 47% up over 1h, expected -0.10% [ADX 26 (trending), RSI 50, 0.1% above EMA20]",
+        "OI: new longs entering (price +0.31%, OI +0.69%) - trend has fuel",
+        "funding: funding normal (-0.0084%/8h) - no crowd extreme",
+        "flow: sellers aggressive (37% net of $155,263 taker vol)"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "OP",
+      "direction": "UNCLEAR",
+      "prob": 52.3,
+      "prob_up": 52.3,
+      "move_pct": 0.02,
+      "horizon": "1h",
+      "confidence": 0.06,
+      "ms_bias": 0.058,
+      "reasons": [
+        "model: 52% up over 1h, expected +0.02% [ADX 25 (trending), RSI 34, 0.5% below EMA20]",
+        "OI: longs liquidated out (price -0.46%, OI -2.00%) - capitulation, bounce risk",
+        "book: bids thicker by 6% within 0.5% of mid",
+        "flow: buyers aggressive (56% net of $48,484 taker vol)"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "BTC",
+      "direction": "UNCLEAR",
+      "prob": 52.5,
+      "prob_up": 52.5,
+      "move_pct": 0.05,
+      "horizon": "1h",
+      "confidence": 0.06,
+      "ms_bias": 0.133,
+      "reasons": [
+        "model: 52% up over 1h, expected +0.05% [RSI 40, 0.2% below EMA20]",
+        "OI: longs liquidated out (price -0.23%, OI -0.21%) - capitulation, bounce risk",
+        "funding: funding normal (0.0020%/8h) - no crowd extreme",
+        "book: bids thicker by 24% within 0.5% of mid"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "AAVE",
+      "direction": "UP",
+      "prob": 53.7,
+      "prob_up": 53.7,
+      "move_pct": 0.09,
+      "horizon": "1h",
+      "confidence": 0.05,
+      "ms_bias": -0.126,
+      "reasons": [
+        "model: 54% up over 1h, expected +0.09% [ADX 41 (trending), RSI 33, 0.5% below EMA20]",
+        "OI: new shorts entering (price -0.61%, OI +0.04%) - downtrend has fuel",
+        "funding: funding normal (0.0035%/8h) - no crowd extreme",
+        "flow: buyers aggressive (46% net of $211,932 taker vol)"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "INJ",
+      "direction": "UNCLEAR",
+      "prob": 50.8,
+      "prob_up": 50.8,
+      "move_pct": 0.12,
+      "horizon": "1h",
+      "confidence": 0.01,
+      "ms_bias": -0.3,
+      "reasons": [
+        "model: 51% up over 1h, expected +0.12% [ADX 36 (trending), RSI 38, 0.6% below EMA20]",
+        "OI: short-covering rally (price +1.06%, OI -0.84%) - no real buyers",
+        "funding: funding normal (-0.0037%/8h) - no crowd extreme",
+        "flow: buyers aggressive (30% net of $68,047 taker vol)"
+      ],
+      "model_ready": true
+    },
+    {
+      "symbol": "XRP",
+      "direction": "UNCLEAR",
+      "prob": 50.3,
+      "prob_up": 50.3,
+      "move_pct": -0.07,
+      "horizon": "1h",
+      "confidence": 0.01,
+      "ms_bias": 0.087,
+      "reasons": [
+        "model: 50% up over 1h, expected -0.07% [ADX 29 (trending), RSI 49, 0.0% above EMA20]",
+        "OI: new longs entering (price +0.17%, OI +5.29%) - trend has fuel",
+        "funding: funding normal (-0.0038%/8h) - no crowd extreme",
+        "flow: buyers aggressive (39% net of $467,955 taker vol)"
+      ],
+      "model_ready": true
+    }
+  ],
+  "orphan_positions": [],
+  "trading_capital": 200.0,
+  "real_balance": 49999.25,
+  "bybit_real_start": 49999.25299249
+}

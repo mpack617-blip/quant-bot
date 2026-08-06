@@ -1,0 +1,72 @@
+name: quant-bot tick
+
+# Runs the bot on GitHub's runners so it keeps trading with the laptop switched off.
+# One run = one market scan. State (journal.db, paper_state.json) is committed back
+# so the next run continues where this one stopped.
+on:
+  schedule:
+    # Every 10 minutes. GitHub treats cron as best-effort and often fires late —
+    # that is acceptable here only because stops/targets live on Bybit's servers,
+    # so risk is managed by the exchange even when a run is delayed or skipped.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+# Never let two runs overlap: they would both write journal.db and the second
+# would clobber the first's trades.
+concurrency:
+  group: quant-bot-tick
+  cancel-in-progress: false
+
+permissions:
+  contents: write           # needed to commit the updated state back
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Cache both pip and the downloaded klines. Without the kline cache every run
+      # re-downloads ~24 coins across three timeframes, which is slow and pointless.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            cache
+          key: quant-bot-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run one tick
+        env:
+          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+          BYBIT_ENV: ${{ vars.BYBIT_ENV || 'demo' }}
+          QUANT_MODE: bybit
+          QUANT_CAPITAL: ${{ vars.QUANT_CAPITAL || '200' }}
+        run: python tick_once.py
+
+      - name: Save state back to the repo
+        if: always()          # a failed tick may still have opened a position
+        run: |
+          git config user.name  "quant-bot"
+          git config user.email "quant-bot@users.noreply.github.com"
+          git add -f journal.db paper_state.json
+          # Nothing changed => nothing to commit. `git commit` would exit 1 and fail the job.
+          if git diff --staged --quiet; then
+            echo "no state change"
+          else
+            git commit -m "state: $(date -u '+%Y-%m-%d %H:%M') [skip ci]"
+            # Another run may have pushed while this one was scanning; rebase onto it
+            # rather than force-pushing over somebody else's trades.
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          fi

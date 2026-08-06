@@ -1,0 +1,18 @@
+# API CREDENTIALS — never commit these.
+# On GitHub the keys come from repo Secrets as env vars instead (see
+# .github/workflows/trade.yml); brokers/bybit.py reads env before this file.
+bybit_keys.json
+.env
+
+# Local runtime noise
+cache/
+*.log
+archive/
+__pycache__/
+*.pyc
+screenshots/
+
+# NOT ignored, on purpose — these ARE the bot's memory between CI runs:
+#   journal.db          trades + open positions
+#   paper_state.json    equity anchor, dashboard state
+#   ml/*.pkl            the trained models; without them the bot has no forecast
