@@ -75,7 +75,20 @@ RANGE_PARAMS = dict(adx_max=18.0, atr_stop=1.2, min_rr=0.6, min_stretch=0.3, wic
 USE_TRAIL = True        # trailing stop ON (user 2026-06-12): once a trade is +1R, stop moves to
                         # breakeven then trails by ATR — locks profit, lets winners run, turns
                         # would-be losers into break-even. The conviction target is the ceiling.
-ML_MIN_PROB = 0.0       # ML gate OFF (user 2026-06-10: "har signal pe trade karo, gate hatao") — bot now trades EVERY displayed signal; news+risk+regime+daily-kill-switch still gate. Restore to 0.42 for selective mode.
+# ML gate RESTORED 2026-08-06 (user: "profit chahiye, loss minimum, accuracy high").
+# Measured walk-forward on the 59-coin universe, 3,045 out-of-sample signals
+# (tune_accuracy.py) — every loss is exactly -1.00R by construction, so the only
+# things that move are win-rate and payoff:
+#     thr 0.00 (the old "trade everything")  36.8% win  PF 0.98  -0.011R  <- LOSES
+#     thr 0.45                               49.1% win  PF 1.42  +0.216R
+#     thr 0.50                               51.1% win  PF 1.53  +0.258R
+#     thr 0.60  <- chosen                    55.3% win  PF 1.93  +0.414R  1.7 trades/day
+#     thr 0.70                               56.8% win  PF 2.29  +0.556R  but 0.35/day
+#                                                                          (44 trades = too
+#                                                                           thin to trust)
+# 0.60 is the best point that still clears the user's "at least one trade a day".
+# Going higher buys a little more edge and loses most of the activity.
+ML_MIN_PROB = 0.60
 DECISION_INTERVAL = "1h"
 SIGNAL_BARS = 500
 SIGNAL_FRESH_BARS = 2   # a setup from the last N closed bars still counts if price is still in play
