@@ -45,6 +45,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Diagnose Bybit reachability from this runner
+        run: |
+          echo "runner public IP + geo:"
+          curl -s https://ipinfo.io/json || true
+          echo ""
+          for host in api.bybit.com api-demo.bybit.com; do
+            echo "--- $host /v5/market/time ---"
+            curl -s -o /tmp/body -w "HTTP %{http_code}\n" "https://$host/v5/market/time" || true
+            head -c 300 /tmp/body; echo ""
+          done
+
       - name: Run one tick
         env:
           BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
