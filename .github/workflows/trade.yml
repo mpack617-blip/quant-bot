@@ -3,13 +3,22 @@ name: quant-bot tick
 # Runs the bot on GitHub's runners so it keeps trading with the laptop switched off.
 # One run = one market scan. State (journal.db, paper_state.json) is committed back
 # so the next run continues where this one stopped.
+# SCHEDULE DISABLED 2026-08-06 — this cannot work on GitHub-hosted runners.
+#
+# Bybit geo-blocks them at the CDN:
+#     HTTP 403 "The Amazon CloudFront distribution is configured to block
+#               access from your country."
+# GitHub's runners live in US datacentres and Bybit does not serve the US, so
+# every request dies before it reaches the API. No code change fixes this — the
+# block is on the network path, not the request.
+#
+# To revive this you need a runner in a country Bybit serves: a self-hosted
+# runner, or a proxy/VPS in a permitted region. Until then the bot runs on the
+# user's own machine (start_bybit_24x7.bat / Startup\QuantBotBybit.vbs).
+#
+# Manual dispatch is kept so the block can be re-tested later.
 on:
-  schedule:
-    # Every 10 minutes. GitHub treats cron as best-effort and often fires late —
-    # that is acceptable here only because stops/targets live on Bybit's servers,
-    # so risk is managed by the exchange even when a run is delayed or skipped.
-    - cron: "*/10 * * * *"
-  workflow_dispatch:        # lets you run it by hand from the Actions tab
+  workflow_dispatch:
 
 # Never let two runs overlap: they would both write journal.db and the second
 # would clobber the first's trades.
@@ -44,17 +53,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Diagnose Bybit reachability from this runner
-        run: |
-          echo "runner public IP + geo:"
-          curl -s https://ipinfo.io/json || true
-          echo ""
-          for host in api.bybit.com api-demo.bybit.com; do
-            echo "--- $host /v5/market/time ---"
-            curl -s -o /tmp/body -w "HTTP %{http_code}\n" "https://$host/v5/market/time" || true
-            head -c 300 /tmp/body; echo ""
-          done
 
       - name: Run one tick
         env:
