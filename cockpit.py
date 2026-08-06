@@ -195,8 +195,9 @@ def status():
         "tv_view": RUNNER.tv_view,
         "forecasts": RUNNER.forecasts,
         "exchange": RUNNER.exchange_info,
-        "trading_capital": getattr(RUNNER, "_bybit_capital", None) or (
-            __import__("runner").BYBIT_CAPITAL if RUNNER.mode == "bybit" else None),
+        "trading_capital": _capital(),
+        "manages_full_account": (RUNNER.mode == "bybit"
+                                 and __import__("runner").BYBIT_CAPITAL is None),
         "real_balance": round(RUNNER.real_equity, 2) if RUNNER.mode == "bybit" else None,
     })
 
@@ -207,6 +208,15 @@ def tv_chart():
     if not shot or not os.path.exists(shot):
         abort(404)
     return send_file(shot, mimetype="image/png")
+
+
+def _capital():
+    """What the bot sizes against: the configured notional book, or — when it runs
+    the whole account — the live balance itself."""
+    if RUNNER.mode != "bybit":
+        return None
+    cap = __import__("runner").BYBIT_CAPITAL
+    return cap if cap is not None else round(RUNNER.real_equity, 2)
 
 
 def _senti():
