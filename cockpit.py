@@ -285,6 +285,32 @@ def _open_browser():
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def _keep_awake() -> None:
+    """Render's free tier suspends a web service after ~15 minutes with no inbound
+    HTTP traffic — which would stop the bot every night. Hitting our own public URL
+    on a timer counts as traffic and keeps the instance alive. Costs one request
+    every 10 minutes and needs no external uptime service.
+
+    Only runs when the platform actually gives us a public URL, so it is a no-op
+    locally.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    import threading, time, urllib.request
+
+    def _worker():
+        while True:
+            time.sleep(600)
+            try:
+                urllib.request.urlopen(f"{url.rstrip('/')}/api/status", timeout=20).read(1)
+            except Exception as e:  # noqa: BLE001
+                print(f"[keep-awake] ping failed: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    print(f"keep-awake pinging {url} every 10 min")
+
+
 if __name__ == "__main__":
     # For unattended 24/7: auto-start the trading loop on launch (set QUANT_AUTOSTART=0 to disable).
     if os.environ.get("QUANT_AUTOSTART", "1") != "0":
@@ -293,5 +319,11 @@ if __name__ == "__main__":
         print(f"runner auto-started ({RUNNER.mode}, {period}s/tick)")
     if os.environ.get("QUANT_NOBROWSER", "0") != "1":
         _open_browser()
-    print("Cockpit -> http://localhost:8787")
-    app.run(host="127.0.0.1", port=8787, threaded=True)
+    _keep_awake()
+    # On a cloud host (Render/Fly/etc) the platform assigns the port via $PORT and
+    # requires binding 0.0.0.0 — 127.0.0.1 would be unreachable and the deploy would
+    # be marked failed. Locally both default back to the usual localhost:8787.
+    port = int(os.environ.get("PORT", "8787"))
+    host = os.environ.get("QUANT_HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+    print(f"Cockpit -> http://{host}:{port}")
+    app.run(host=host, port=port, threaded=True)

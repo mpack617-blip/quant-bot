@@ -1,0 +1,36 @@
+# Render deployment — the bot as an always-on web service.
+#
+# WHY RENDER AND WHY FRANKFURT: Bybit geo-blocks US datacentres at the CDN
+# ("The Amazon CloudFront distribution is configured to block access from your
+# country"), which is what killed the GitHub Actions attempt — its runners are in
+# US regions. Frankfurt is in a region Bybit serves, so the API is reachable.
+# If this service is ever moved to a US or Singapore region it will break again.
+#
+# The cockpit is already a Flask app that auto-starts the trading loop in a
+# background thread, so "web service" is the right shape: Render keeps the process
+# alive, and the dashboard becomes reachable from anywhere.
+services:
+  - type: web
+    name: quant-bot
+    runtime: python
+    region: frankfurt          # MUST be a Bybit-permitted region - see above
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python cockpit.py
+    healthCheckPath: /api/status
+    envVars:
+      - key: QUANT_MODE
+        value: bybit
+      - key: QUANT_CAPITAL
+        value: "200"
+      - key: QUANT_PERIOD
+        value: "180"
+      - key: QUANT_NOBROWSER      # never try to open a browser on a server
+        value: "1"
+      - key: BYBIT_ENV
+        value: demo
+      # Set these in the Render dashboard, NOT here - they are secrets.
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false

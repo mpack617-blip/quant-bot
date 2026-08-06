@@ -460,6 +460,25 @@ class QuantRunner:
         except Exception as e:  # noqa: BLE001
             _log(f"[reconcile] could not read positions, skipping: {e}")
             return
+        # --- ADOPT: positions the exchange has that our journal does not ---
+        # On a cloud host the disk is ephemeral, so a redeploy or restart wipes
+        # journal.db while the position keeps living on Bybit. Without this the bot
+        # would never manage or close that trade, and would happily open a second one
+        # in the same symbol. The exchange is the source of truth in BOTH directions.
+        known = {p["symbol"] for p in journal.open_positions()}
+        for p in self.ex.positions():
+            if p["symbol"] in known:
+                continue
+            side = 1 if p["side"] == "long" else -1
+            stop = p.get("stop") or p["avgFill"] * (1 - 0.02 * side)
+            target = p.get("target") or p["avgFill"] * (1 + 0.04 * side)
+            journal.record_open(p["symbol"], side, p["avgFill"], p["qty"], stop, target,
+                                "ADOPTED from exchange after restart", {}, venue="bybit")
+            self._activity(f"ADOPTED {p['symbol'].replace('USDT','')} "
+                           f"{'LONG' if side == 1 else 'SHORT'} from Bybit "
+                           f"(stop {stop:.4f}) - journal was out of date")
+            _log(f"ADOPTED {p['symbol']} from exchange (qty {p['qty']} @ {p['avgFill']})")
+
         for pos in journal.open_positions():
             sym = pos["symbol"]
             # Guard 3: only positions that actually LIVE on Bybit. A TradingView or
