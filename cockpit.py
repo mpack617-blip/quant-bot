@@ -168,9 +168,14 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <table id="fc"><thead><tr><th>Coin</th><th>Next move</th><th>Odds</th><th>Exp. move</th>
      <th>Conviction</th><th>Order flow</th><th>Why</th></tr></thead><tbody></tbody></table></div>
  <div class="card full"><h2>Open positions</h2><table id="pos"><tbody></tbody></table></div>
- <div class="card full"><h2>🖥️ Bot's live TradingView chart</h2>
-   <div style="color:#8b949e;font-size:12px;margin-bottom:6px" id="tvinfo">warming up…</div>
-   <img id="tvimg" style="width:100%;border-radius:8px;border:1px solid #30363d;display:none" alt="bot chart"></div>
+ <div class="card full"><h2>📈 Bot ka chart <span id="chartsym"></span></h2>
+   <div id="chartinfo" style="color:#8b949e;font-size:12px;margin-bottom:8px">warming up…</div>
+   <div style="overflow-x:auto"><svg id="chart" viewBox="0 0 960 380" preserveAspectRatio="xMidYMid meet"
+     style="width:100%;min-width:620px;height:auto;background:#0d1117;border:1px solid #21262d;border-radius:8px"></svg></div>
+   <div id="chartnotes" style="margin-top:10px;font-size:12px;color:#8b949e;line-height:1.7"></div>
+   <div style="margin-top:8px;font-size:11px;color:#586069">
+     Ye lines bot khud nikaalta hai: trend line (3+ touches), range rectangle, support/resistance,
+     aur uska entry / stop / target. Structure padha jaata hai — trade abhi bhi strategy + EV gate leta hai.</div></div>
  <div class="card full"><h2>🔬 Live activity (what the bot is doing now)</h2>
    <div style="color:#8b949e;font-size:12px;margin-bottom:6px" id="scaninfo">--</div>
    <div id="activity" style="height:150px;overflow:auto;font-size:12px;font-family:Consolas,monospace"></div></div>
@@ -222,12 +227,7 @@ async function refresh(){
  let ms=s.market_sentiment||{};senti.textContent='News sentiment '+ms.score+(ms.risk_off?' (RISK-OFF)':'');
  scaninfo.textContent='Scans done: '+(s.scans||0)+'  |  crypto-only  |  '+(s.last_note||'');
  let af=document.getElementById('activity');af.innerHTML=(s.activity||['(warming up...)']).map(a=>'• '+a).join('<br>');
- let tv=s.tv_view||{};let ti=document.getElementById('tvinfo');let tg=document.getElementById('tvimg');
- if(tv.shot){let k={TRADE:'🟢 IN TRADE',SETUP:'🎯 SETUP',WATCH:'👁️ WATCHING'}[tv.kind]||'';
-   ti.innerHTML=k+' <b>'+(tv.symbol||'')+'</b> '+(tv.side?'<b>'+tv.side+'</b> ':'')+'— '+(tv.label||'')+
-     ' <span style="color:#586069">('+(tv.updated||'').slice(11,19)+' UTC)</span>';
-   tg.src='/tv_chart.png?t='+Date.now();tg.style.display='block';}
- else{ti.textContent='Bot will drive the TradingView chart once it picks a focus coin (needs TradingView open w/ debug port).';}
+ drawChart(s.chart);
  let wb=document.querySelector('#watch tbody');wb.innerHTML='';
  (s.watching||[]).forEach(w=>{let col=w.regime.indexOf('UP')>=0?'green':(w.regime.indexOf('DOWN')>=0?'red':'');
    let sc=w.score||0;let scol=sc>=70?'green':(sc>=40?'':'#8b949e');
@@ -269,6 +269,88 @@ async function refresh(){
    (t.postmortem||t.exit_reason||'')+'</td></tr>'});
  if(!h.length)hb.innerHTML='<tr><td colspan=8>No trades yet.</td></tr>';
 }
+
+// ---- the bot's own chart -------------------------------------------------
+// Drawn from the same numbers the bot decides on: its candles, its moving averages,
+// and the structure it detected (features/structure.py). Nothing here is decorative -
+// every line on this chart is something the bot actually read. It replaces the old
+// TradingView screenshot, which needed a desktop TradingView over CDP and therefore
+// could never work on a cloud host.
+function drawChart(c){
+ let svg=document.getElementById('chart');
+ let info=document.getElementById('chartinfo');
+ let notes=document.getElementById('chartnotes');
+ let symEl=document.getElementById('chartsym');
+ if(!svg)return;
+ if(!c||!c.candles||!c.candles.length){info.textContent='warming up - pehla scan poora hone do...';return}
+ const W=960,H=380,L=8,R=88,T=14,B=24;      // right margin holds the price labels
+ const n=c.candles.length;
+ let lo=Infinity,hi=-Infinity;
+ c.candles.forEach(k=>{lo=Math.min(lo,k.l);hi=Math.max(hi,k.h)});
+ // the plan and the drawings must fit too, else the stop can sit off-screen
+ let extra=[];
+ if(c.plan)extra.push(c.plan.entry,c.plan.stop,c.plan.target);
+ (c.drawings||[]).forEach(d=>{if(d.type=='trendline'){extra.push(d.y0,d.y1)}
+   else if(d.type=='rect'){extra.push(d.y0,d.y1)}else if(d.type=='level'){extra.push(d.y)}});
+ extra.forEach(v=>{if(v!=null&&isFinite(v)){lo=Math.min(lo,v);hi=Math.max(hi,v)}});
+ const pad=((hi-lo)*0.06)||1;lo-=pad;hi+=pad;
+ const x=i=>L+(W-L-R)*(i/((n-1)||1));
+ const y=p=>T+(H-T-B)*(1-(p-lo)/((hi-lo)||1));
+ const bw=Math.max(1.5,(W-L-R)/n*0.62);
+ const fmt=p=>{let a=Math.abs(p);return a>=1000?p.toFixed(0):a>=1?p.toFixed(2):a>=0.01?p.toFixed(4):p.toFixed(6)};
+ let o=[];
+ for(let g=0;g<=4;g++){let py=T+(H-T-B)*g/4;let pv=hi-(hi-lo)*g/4;
+   o.push('<line x1="'+L+'" y1="'+py+'" x2="'+(W-R)+'" y2="'+py+'" stroke="#1c2128"/>');
+   o.push('<text x="'+(W-R+6)+'" y="'+(py+4)+'" fill="#484f58" font-size="10">'+fmt(pv)+'</text>')}
+ // range rectangle first, so candles sit on top of it
+ (c.drawings||[]).filter(d=>d.type=='rect').forEach(d=>{
+   let yt=y(d.y1),yb=y(d.y0);
+   o.push('<rect x="'+x(d.x0)+'" y="'+yt+'" width="'+(x(d.x1)-x(d.x0))+'" height="'+Math.max(1,yb-yt)+
+     '" fill="#58a6ff" fill-opacity="0.07" stroke="#58a6ff" stroke-opacity="0.35" stroke-dasharray="4 3"/>');
+   o.push('<text x="'+(x(d.x0)+6)+'" y="'+(yt+13)+'" fill="#58a6ff" font-size="10">'+d.label+'</text>')});
+ c.candles.forEach((k,i)=>{let up=k.c>=k.o;let col=up?'#3fb950':'#f85149';
+   o.push('<line x1="'+x(i)+'" y1="'+y(k.h)+'" x2="'+x(i)+'" y2="'+y(k.l)+'" stroke="'+col+'" stroke-width="1"/>');
+   let y1=y(Math.max(k.o,k.c)),y2=y(Math.min(k.o,k.c));
+   o.push('<rect x="'+(x(i)-bw/2)+'" y="'+y1+'" width="'+bw+'" height="'+Math.max(1,y2-y1)+'" fill="'+col+'"/>')});
+ const path=(arr,col)=>{let p='',started=false;
+   arr.forEach((v,i)=>{if(v==null||!isFinite(v))return;p+=(started?'L':'M')+x(i)+' '+y(v);started=true});
+   return p?'<path d="'+p+'" fill="none" stroke="'+col+'" stroke-width="1.3" opacity="0.85"/>':''};
+ o.push(path(c.ema20||[],'#d29922'));o.push(path(c.ema50||[],'#8957e5'));
+ (c.drawings||[]).forEach(d=>{
+  if(d.type=='trendline'){let col=d.kind=='resistance'?'#f85149':'#3fb950';
+    o.push('<line x1="'+x(d.x0)+'" y1="'+y(d.y0)+'" x2="'+x(d.x1)+'" y2="'+y(d.y1)+'" stroke="'+col+
+      '" stroke-width="1.6" stroke-dasharray="6 4" opacity="0.9"/>');
+    o.push('<text x="'+(x(d.x0)+4)+'" y="'+(y(d.y0)-6)+'" fill="'+col+'" font-size="10">'+d.label+'</text>')}
+  else if(d.type=='level'){
+    o.push('<line x1="'+L+'" y1="'+y(d.y)+'" x2="'+(W-R)+'" y2="'+y(d.y)+
+      '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4" opacity="0.5"/>');
+    // label on the LEFT: the right margin is reserved for the entry/stop/target
+    // badges, and two labels stacked on the same pixel row read as neither.
+    o.push('<text x="'+(L+4)+'" y="'+(y(d.y)-4)+'" fill="#8b949e" font-size="9">'+d.label+'</text>')}});
+ if(c.plan){
+  const lvl=(p,col,txt)=>{if(p==null||!isFinite(p))return;
+    o.push('<line x1="'+L+'" y1="'+y(p)+'" x2="'+(W-R)+'" y2="'+y(p)+'" stroke="'+col+'" stroke-width="1.4"/>');
+    o.push('<rect x="'+(W-R+2)+'" y="'+(y(p)-8)+'" width="'+(R-6)+'" height="16" rx="3" fill="'+col+'"/>');
+    o.push('<text x="'+(W-R+7)+'" y="'+(y(p)+4)+'" fill="#0d1117" font-size="10" font-weight="700">'+txt+' '+fmt(p)+'</text>')};
+  lvl(c.plan.target,'#3fb950','TP');lvl(c.plan.entry,'#58a6ff','IN');lvl(c.plan.stop,'#f85149','SL')}
+ // time axis: a few dates so "120 bars" is an actual window, not an abstraction
+ for(let g=0;g<4;g++){let i=Math.round((n-1)*g/3);let t=(c.candles[i]||{}).t||'';
+   let anchor=g==0?'start':(g==3?'end':'middle');
+   o.push('<text x="'+x(i)+'" y="'+(H-6)+'" fill="#484f58" font-size="9" text-anchor="'+anchor+'">'+t+'</text>')}
+ svg.innerHTML=o.join('');
+ let badge={TRADE:'<span class="pill on">IN TRADE</span>',
+   SETUP:'<span class="pill" style="background:#9e6a03;color:#fff">SETUP</span>',
+   WATCH:'<span class="pill" style="background:#21262d;color:#8b949e">WATCHING</span>'}[c.kind]||'';
+ symEl.innerHTML=' \u2014 <b>'+c.symbol+'</b> <span style="color:#8b949e;font-size:12px">'+c.interval+'</span> '+badge;
+ let pl=c.plan?(' \u00b7 '+c.plan.side+' entry '+fmt(c.plan.entry)+' / stop '+fmt(c.plan.stop)+
+   ' / target '+fmt(c.plan.target)):'';
+ info.innerHTML='<span style="color:#d29922">\u2014 EMA20</span> &nbsp;<span style="color:#8957e5">\u2014 EMA50</span>'+
+   '&nbsp; <span style="color:#f85149">- - resistance</span> &nbsp;<span style="color:#3fb950">- - support</span>'+
+   '&nbsp; <span style="color:#58a6ff">\u25ad range</span>'+pl+
+   ' <span style="color:#586069">('+(c.updated||'').slice(11,19)+' UTC)</span>';
+ notes.innerHTML=(c.notes||[]).map(t=>'\u2022 '+t).join('<br>');
+}
+
 async function toggle(){let s=await (await fetch('/api/status')).json();
  let r=await fetch(s.running?'/api/stop':'/api/start',{method:'POST',
    headers:{'Content-Type':'application/json'},body:'{}'});
@@ -317,6 +399,7 @@ def status():
         },
         "last_note": RUNNER.last_note,
         "tv_view": RUNNER.tv_view,
+        "chart": RUNNER.chart,
         "forecasts": RUNNER.forecasts,
         "exchange": RUNNER.exchange_info,
         "trading_capital": _capital(),

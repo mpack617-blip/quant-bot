@@ -114,6 +114,7 @@ MIN_STOP_PCT = 0.004    # 0.4% — below the 1st percentile of a year of real se
 MIN_STOP_ATR = 0.30     # a stop closer than a third of an ATR is inside the noise
 RR_CAP = 3.0            # the widest reward:risk the model has ever been trained on
 STALE_EV = -9.0         # sentinel: "this setup is no longer tradeable"
+CHART_BARS = 120        # how much history the bot draws on its own chart
 DECISION_INTERVAL = "1h"
 SIGNAL_BARS = 500
 SIGNAL_FRESH_BARS = 2   # a setup from the last N closed bars still counts if price is still in play
@@ -321,6 +322,7 @@ class QuantRunner:
         self._fc_cache: dict[str, object] = {}   # per-tick memo (cleared each tick)
         self._orphans: set[str] = set()     # open positions belonging to a DIFFERENT venue
         self._btc_df = None                 # BTC candles for context features (per tick)
+        self.chart: dict = {}               # the annotated chart the bot is reading
 
     # ---- persistence ----
     def _load_equity(self, default: float) -> float:
@@ -397,6 +399,7 @@ class QuantRunner:
             "lessons": journal.lessons(5),
             "last_note": self.last_note,
             "tv_view": self.tv_view,
+            "chart": self.chart,
             "mode": self.mode,
             "exchange": self.exchange_info,
             "forecasts": self.forecasts,
@@ -504,6 +507,67 @@ class QuantRunner:
             with journal._conn() as c:
                 c.execute("UPDATE positions SET stop=? WHERE symbol=?", (new_stop, sym))
             self._activity(f"TRAIL {sym} stop -> {new_stop:.4f} (locking profit)")
+
+    # ---- the chart the bot is reading ----
+    def _build_chart(self, plans: list[dict], watching: list[dict]) -> None:
+        """Draw what the bot is looking at, the way a trader would.
+
+        The bot used to be able to drive a real TradingView chart over CDP, but that
+        needs TradingView running on a desktop — impossible on a cloud host. So it
+        draws its own: candles, the moving averages it trades around, and the trend
+        lines / range / support-resistance it has actually detected (features/
+        structure.py), plus the entry, stop and target of the plan.
+
+        Focus order — open position first, then the best live setup, then the coin
+        closest to firing. That is the same order a person would look in.
+        """
+        try:
+            from features.structure import analyse, to_drawings
+            pos = journal.open_positions()
+            mine = [p for p in pos if self._owns(p)]
+            focus, kind, plan = None, "WATCH", None
+            if mine:
+                focus, kind = mine[0]["symbol"], "TRADE"
+                plan = {"entry": mine[0]["entry"], "stop": mine[0]["stop"],
+                        "target": mine[0]["target"],
+                        "side": "LONG" if mine[0]["side"] == 1 else "SHORT"}
+            elif plans:
+                best = max(plans, key=lambda p: p.get("ev", -9))
+                # Only call it a SETUP if it would actually be traded. A signal the
+                # EV gate rejects is something the bot is watching, not planning.
+                focus = best["sym"]
+                kind = "SETUP" if best.get("ev", -9) >= EV_MIN else "WATCH"
+                plan = {"entry": best["entry"], "stop": best["stop"],
+                        "target": best["target"],
+                        "side": "LONG" if best["side"] == 1 else "SHORT"}
+            elif watching:
+                focus = watching[0]["symbol"] + "USDT"
+            if not focus:
+                return
+
+            df = get_klines_cached(focus, DECISION_INTERVAL, bars=SIGNAL_BARS, max_age_min=5)
+            feats = feature_frame(df)
+            st = analyse(df, lookback=CHART_BARS)
+            d = df.iloc[-CHART_BARS:]
+            f = feats.iloc[-CHART_BARS:]
+            self.chart = {
+                "symbol": focus.replace("USDT", ""),
+                "interval": DECISION_INTERVAL,
+                "kind": kind,
+                "plan": plan,
+                "candles": [
+                    {"t": str(ix)[5:16], "o": float(r.open), "h": float(r.high),
+                     "l": float(r.low), "c": float(r.close)}
+                    for ix, r in zip(d.index, d.itertuples())
+                ],
+                "ema20": [None if v != v else round(float(v), 8) for v in f["ema20"]],
+                "ema50": [None if v != v else round(float(v), 8) for v in f["ema50"]],
+                "drawings": to_drawings(st, d),
+                "notes": st.notes,
+                "updated": _now(),
+            }
+        except Exception as e:  # noqa: BLE001
+            _log(f"[chart] {e}")
 
     # ---- operator commands ----------------------------------------------------
     # Everything below is ONLY ever called from an explicit operator instruction
@@ -845,6 +909,14 @@ class QuantRunner:
                                  natural_rr=natural_rr, side=sig.side,
                                  entry=price, stop=sig.stop, fwd_agree=fwd_agree,
                                  equity=self.equity)
+        # CONVICTION SIZES THE TRADE; THE STRATEGY STILL SETS THE LEVELS.
+        # It used to also tighten the stop and stretch the target on high-conviction
+        # setups. That quietly broke the EV gate: EV is p x RR for the setup's OWN
+        # stop and target, and those are the levels the model's training labels were
+        # measured against. Moving the target further out lowers the true probability
+        # of reaching it, so the trade taken was no longer the trade that was scored.
+        # Size varies with conviction; where to get out does not.
+        plan.stop, plan.target = sig.stop, sig.target
 
         decision = self.risk.evaluate(side=sig.side, entry=price, stop=plan.stop,
                                       open_positions=journal.open_positions(),
@@ -1062,7 +1134,7 @@ class QuantRunner:
                                    f"(ADX {entry['adx']:.0f}, RSI {entry['rsi']:.0f}, {why})")
                     plans.append({"sym": sym, "side": sig.side, "entry": e_price,
                                   "stop": sig.stop, "target": sig.target, "label": setup_tag,
-                                  "score": snap["score"]})
+                                  "score": snap["score"], "ev": ev_})
                 watching.append(entry)
                 if not self.risk.halted:
                     self._try_enter(sym, e_df, e_feats, e_a, sentiment, sig)
@@ -1075,6 +1147,7 @@ class QuantRunner:
         # --- drive the real TradingView chart so the bot trades VISIBLY ---
         if self.mode == "tradingview" and self.tv is not None:
             self._visualize(plans, watching)
+        self._build_chart(plans, watching)
         self.scans += 1
         bias_txt = {1: "BTC UP", -1: "BTC DOWN", 0: "BTC flat"}[self.mkt_bias]
         if self._orphans:
