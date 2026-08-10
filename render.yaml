@@ -23,10 +23,15 @@ services:
     envVars:
       - key: QUANT_MODE
         value: bybit
-      # "full" = the bot manages the whole account balance and sizes off it.
-      # Put a number here instead to rehearse a smaller account on a big balance.
+      # The book the bot sizes, risks and kill-switches against.
+      # A NUMBER = rehearse an account of that size on top of a bigger balance;
+      # "full" = manage the whole exchange balance.
+      # Set to 100 on the operator's instruction: Bybit's demo balance itself cannot
+      # be set to an arbitrary figure (the API only tops demo funds up, and a reset
+      # restores the default), so the cap lives here instead. The exchange balance
+      # stays ~$50k and only this figure decides position size.
       - key: QUANT_CAPITAL
-        value: full
+        value: "100"
       # 300s, not 180s: the universe grew 24 -> 59 coins and Render's free instance is
       # 0.1 CPU, so a full scan takes minutes. A period shorter than a scan just stacks
       # ticks on top of each other.
