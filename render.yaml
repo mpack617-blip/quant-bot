@@ -39,3 +39,8 @@ services:
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
+      # Password for the cockpit's WRITE actions (close positions, change capital,
+      # stop the bot). This dashboard is on a public URL, so until this is set the
+      # cockpit is read-only: it fails closed, never open. Reading is always free.
+      - key: QUANT_CMD_TOKEN
+        sync: false

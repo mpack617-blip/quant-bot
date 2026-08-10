@@ -12,11 +12,38 @@ from flask import Flask, jsonify, request, send_file, abort
 
 import journal
 import chat as chat_brain
+import commands as operator_commands
 from runner import QuantRunner
 
 import os
 
 app = Flask(__name__)
+
+# --- who may CHANGE things -----------------------------------------------------
+# Reading the dashboard is harmless. Closing positions, resizing the book or
+# stopping the bot are not — and on Render this cockpit is on the public internet,
+# where anyone with the URL could hit these endpoints. So:
+#   * running locally  -> trusted, no password needed.
+#   * public (PORT set by the host) -> QUANT_CMD_TOKEN must be set AND supplied,
+#     otherwise write endpoints are refused outright. Failing closed is the point:
+#     a public deploy with no token gets a read-only cockpit, not an open one.
+CMD_TOKEN = os.environ.get("QUANT_CMD_TOKEN", "").strip()
+IS_PUBLIC = bool(os.environ.get("PORT") or os.environ.get("RENDER_EXTERNAL_URL"))
+
+
+def _auth(req) -> tuple[bool, str]:
+    if not IS_PUBLIC and not CMD_TOKEN:
+        return True, ""
+    if not CMD_TOKEN:
+        return False, ("Ye cockpit public URL pe hai aur koi password set nahi hai, "
+                       "isliye commands band hain. Render → Environment me "
+                       "QUANT_CMD_TOKEN set karo, phir yahan wahi password daalo.")
+    supplied = (req.headers.get("X-Cmd-Token")
+                or (req.get_json(silent=True) or {}).get("token")
+                or req.args.get("token") or "")
+    if supplied == CMD_TOKEN:
+        return True, ""
+    return False, "🔒 Galat ya missing password — command nahi chalayi."
 # Default to the live TradingView paper account (the user attached the bot to it).
 # Set QUANT_MODE=paper to use the internal $1000 simulator instead.
 RUNNER = QuantRunner(mode=os.environ.get("QUANT_MODE", "tradingview"))
@@ -73,10 +100,19 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <th>Time</th><th>Sym</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>R</th><th>Why / Lesson</th>
    </tr></thead><tbody></tbody></table></div>
  <div class="card full"><h2>Lessons learned</h2><div id="log"></div></div>
- <div class="card full"><h2>💬 Chat with the bot</h2><div id="chat"></div>
-   <input id="q" placeholder="abhi konsa trade le raha hai? pnl kitna hai?"
+ <div class="card full"><h2>💬 Chat &amp; commands</h2><div id="chat"></div>
+   <input id="q" placeholder="pucho: 'pnl kitna hai' &nbsp;|&nbsp; bolo: 'sab position close kar do', 'balance 100 usdt kar do'"
      onkeydown="if(event.key=='Enter')send()">
-   <button class="start" onclick="send()">Ask</button></div>
+   <button class="start" onclick="send()">Send</button>
+   <div id="authrow" style="margin-top:8px;display:none">
+     <input id="tok" type="password" style="width:40%" placeholder="command password (QUANT_CMD_TOKEN)"
+       oninput="localStorage.setItem('cmdtok',this.value)">
+     <span style="color:#8b949e;font-size:11px">— sirf change karne wale commands ke liye; sawaal free hain</span>
+   </div>
+   <div style="color:#8b949e;font-size:11px;margin-top:6px">
+     Commands: "sab position close kar do" · "ZRO close kar do" · "balance 100 usdt kar do" ·
+     "capital full kar do" · "bot band kar do" / "bot start karo" · "help".
+     Baaki time bot khud trade karta rehta hai.</div></div>
 </div>
 <script>
 async function refresh(){
@@ -107,6 +143,10 @@ async function refresh(){
  } else mt.textContent=s.mode=='tradingview'?'TradingView paper account':'internal simulator';
  let ms=s.market_sentiment||{};senti.textContent='News sentiment '+ms.score+(ms.risk_off?' (RISK-OFF)':'');
  scaninfo.textContent='Scans done: '+(s.scans||0)+'  |  crypto-only  |  '+(s.last_note||'');
+ let ar=document.getElementById('authrow');
+ if(s.cmd_auth=='token'){ar.style.display='block';let t=document.getElementById('tok');
+   if(!t.value){let sv=localStorage.getItem('cmdtok');if(sv)t.value=sv}}
+ else ar.style.display='none';
  let af=document.getElementById('activity');af.innerHTML=(s.activity||['(warming up...)']).map(a=>'• '+a).join('<br>');
  let tv=s.tv_view||{};let ti=document.getElementById('tvinfo');let tg=document.getElementById('tvimg');
  if(tv.shot){let k={TRADE:'🟢 IN TRADE',SETUP:'🎯 SETUP',WATCH:'👁️ WATCHING'}[tv.kind]||'';
@@ -151,14 +191,20 @@ async function refresh(){
    (t.postmortem||t.exit_reason||'')+'</td></tr>'});
  if(!h.length)hb.innerHTML='<tr><td colspan=8>No trades yet.</td></tr>';
 }
+function tok(){let t=document.getElementById('tok');return t?t.value:''}
 async function toggle(){let s=await (await fetch('/api/status')).json();
- await fetch(s.running?'/api/stop':'/api/start',{method:'POST'});setTimeout(refresh,400)}
+ let r=await fetch(s.running?'/api/stop':'/api/start',{method:'POST',
+   headers:{'Content-Type':'application/json','X-Cmd-Token':tok()},body:'{}'});
+ if(r.status==403){let e=await r.json();alert(e.error)}
+ setTimeout(refresh,400)}
 async function send(){let q=document.getElementById('q');if(!q.value)return;
  chat.innerHTML+='<div class="u">You: '+q.value+'</div>';let question=q.value;q.value='';
- let r=await (await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({q:question})})).json();
+ let r=await (await fetch('/api/chat',{method:'POST',
+   headers:{'Content-Type':'application/json','X-Cmd-Token':tok()},
+   body:JSON.stringify({q:question,token:tok()})})).json();
  chat.innerHTML+='<div class="b">Bot ('+r.engine+'): '+r.answer.replace(/\\n/g,'<br>')+'</div>';
- chat.scrollTop=chat.scrollHeight}
+ chat.scrollTop=chat.scrollHeight;
+ if((r.engine||'').indexOf('command')==0)setTimeout(refresh,800)}
 refresh();setInterval(refresh,5000);
 </script></body></html>"""
 
@@ -199,6 +245,7 @@ def status():
         "manages_full_account": (RUNNER.mode == "bybit"
                                  and __import__("runner").BYBIT_CAPITAL is None),
         "real_balance": round(RUNNER.real_equity, 2) if RUNNER.mode == "bybit" else None,
+        "cmd_auth": "token" if (IS_PUBLIC or CMD_TOKEN) else "open",
     })
 
 
@@ -243,6 +290,9 @@ def trades():
 
 @app.route("/api/start", methods=["POST"])
 def start():
+    ok, why = _auth(request)
+    if not ok:
+        return jsonify({"error": why}), 403
     period = int(request.args.get("period", 120))
     started = RUNNER.start(period)
     return jsonify({"started": started, "running": RUNNER.running})
@@ -250,14 +300,48 @@ def start():
 
 @app.route("/api/stop", methods=["POST"])
 def stop():
+    ok, why = _auth(request)
+    if not ok:
+        return jsonify({"error": why}), 403
     RUNNER.stop()
     return jsonify({"running": RUNNER.running})
 
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    q = (request.get_json(silent=True) or {}).get("q", "")
+    body = request.get_json(silent=True) or {}
+    q = body.get("q", "")
+    # An instruction is executed; anything else is answered. The bot keeps trading
+    # by itself either way — commands are the operator's override, not its driver.
+    cmd = operator_commands.parse(q)
+    if cmd is not None:
+        if cmd.kind == "help":
+            return jsonify({"answer": operator_commands.HELP_TEXT, "engine": "command"})
+        ok, why = _auth(request)
+        if not ok:
+            return jsonify({"answer": why, "engine": "command"})
+        try:
+            answer = operator_commands.execute(cmd, RUNNER)
+        except Exception as e:  # noqa: BLE001
+            answer = f"⚠️ Command chali nahi: {e}"
+        return jsonify({"answer": answer, "engine": f"command:{cmd.kind}"})
     return jsonify(chat_brain.ask(q))
+
+
+@app.route("/api/command", methods=["POST"])
+def command():
+    """Same commands, for scripts/curl: {"cmd": "close_all"} or free text in "q"."""
+    ok, why = _auth(request)
+    if not ok:
+        return jsonify({"error": why}), 403
+    body = request.get_json(silent=True) or {}
+    if body.get("q"):
+        cmd = operator_commands.parse(body["q"])
+        if cmd is None:
+            return jsonify({"error": "not a recognised command", "help": operator_commands.HELP_TEXT}), 400
+    else:
+        cmd = operator_commands.Command(body.get("cmd", ""), body.get("arg"), raw="api")
+    return jsonify({"result": operator_commands.execute(cmd, RUNNER)})
 
 
 def _open_browser():

@@ -177,6 +177,26 @@ TV_RISK = {
 _cap = os.environ.get("QUANT_CAPITAL", "full").strip().lower()
 BYBIT_CAPITAL = None if _cap in ("full", "", "0", "auto") else float(_cap)
 
+
+def _saved_capital():
+    """A capital figure the operator set from the cockpit (chat command) outlives the
+    process — otherwise a restart would silently put the bot back on the env value and
+    it would resume trading a size the operator had explicitly changed.
+
+    Returns the sentinel "__none__" when nothing was ever set by hand.
+    """
+    if not STATE_PATH.exists():
+        return "__none__"
+    try:
+        return json.loads(STATE_PATH.read_text()).get("capital_override", "__none__")
+    except Exception:  # noqa: BLE001
+        return "__none__"
+
+
+_saved = _saved_capital()
+if _saved != "__none__":
+    BYBIT_CAPITAL = None if _saved in (None, "full") else float(_saved)
+
 BYBIT_RISK = {
     "max_risk_per_trade_pct": 4.0,
     # Raised 3 -> 8 alongside the 24 -> 59 coin universe: with more markets scanned,
@@ -363,6 +383,12 @@ class QuantRunner:
             "real_balance": round(self.real_equity, 2) if self.mode == "bybit" else None,
             "bybit_real_start": self._real_start if self.mode == "bybit" else None,
         }
+        if self.mode == "bybit":
+            # Written on EVERY tick, not just when it changes: this file is rewritten
+            # whole, so leaving the key out would erase an operator's setting.
+            saved = _saved_capital()
+            if saved != "__none__":
+                st["capital_override"] = saved
         STATE_PATH.write_text(json.dumps(st, indent=2))
 
     # ---- position management ----
@@ -452,6 +478,145 @@ class QuantRunner:
             with journal._conn() as c:
                 c.execute("UPDATE positions SET stop=? WHERE symbol=?", (new_stop, sym))
             self._activity(f"TRAIL {sym} stop -> {new_stop:.4f} (locking profit)")
+
+    # ---- operator commands ----------------------------------------------------
+    # Everything below is ONLY ever called from an explicit operator instruction
+    # (cockpit chat / API). The trading loop never calls these — it keeps deciding
+    # entries and exits on its own. That separation is the point: the bot trades
+    # autonomously, the operator can still intervene.
+
+    def close_now(self, sym: str, why: str = "manual close (operator)") -> dict:
+        """Flatten one position because the operator said so.
+
+        Deliberately shares the accounting of `_manage`'s exit path — PnL comes from
+        the exchange (realised PnL if it reports one, otherwise the balance delta),
+        never from our own estimate, and the journal is only written once the close
+        is VERIFIED. A close that failed must not be recorded as a closed trade.
+        """
+        sym = sym.upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        pos = next((p for p in journal.open_positions() if p["symbol"] == sym), None)
+        if pos is None:
+            return {"ok": False, "symbol": sym, "msg": f"{sym}: koi open position nahi hai"}
+        if not self._owns(pos):
+            return {"ok": False, "symbol": sym,
+                    "msg": f"{sym} is on venue '{pos.get('venue') or 'legacy'}', "
+                           f"bot abhi '{self.mode}' pe hai — isko close nahi kar sakta"}
+
+        if self.ex is None:                       # internal simulator
+            price = pos["entry"]
+            try:
+                price = float(get_klines_cached(sym, DECISION_INTERVAL, bars=50,
+                                                max_age_min=1)["close"].iloc[-1])
+            except Exception:  # noqa: BLE001
+                pass
+            fill = self.broker.market(price, -pos["side"])
+            pnl = (fill - pos["entry"]) * pos["qty"] * pos["side"]
+            pnl -= abs(fill * pos["qty"]) * self.broker.fee
+            self.equity += pnl
+        else:
+            eq_before = self.ex.equity() or self.equity
+            res = self.ex.close(sym)
+            if not res["ok"]:
+                msg = f"{sym} close FAILED: {res['raw']}"
+                _log(msg)
+                self._activity(msg)
+                return {"ok": False, "symbol": sym, "msg": msg}
+            eq_after = self.ex.equity() or eq_before
+            pnl = eq_after - eq_before
+            fill = pos["entry"]
+            if self.mode == "bybit":
+                # The exchange's own realised figure is the honest one (fees included);
+                # the balance delta is only a fallback if it hasn't settled yet.
+                realised = self.ex.closed_pnl(sym, limit=3)
+                if realised:
+                    pnl, fill = realised[0]["pnl"], realised[0]["exit"]
+                else:
+                    fill = self.ex.last_price(sym) or pos["entry"]
+                self.real_equity = eq_after
+                self.equity = self._book_equity()
+            else:
+                self.equity = eq_after
+
+        risk_unit = abs(pos["entry"] - pos["stop"]) * pos["qty"]
+        r = pnl / risk_unit if risk_unit else None
+        rec = journal.record_close(sym, fill, round(pnl, 4), round(r, 2) if r else None, why)
+        self.risk.update_equity(self.equity)
+        note = f"MANUAL CLOSE {sym} pnl ${pnl:+.2f} -> eq ${self.equity:.2f}"
+        if rec.get("postmortem"):
+            note += f" | lesson: {rec['postmortem']}"
+        self.last_note = note
+        _log(note)
+        self._activity(note)
+        return {"ok": True, "symbol": sym, "pnl": round(pnl, 4), "msg": note}
+
+    def close_all(self, why: str = "manual close-all (operator)") -> list[dict]:
+        """Flatten every position this venue owns. Positions belonging to another
+        venue are reported, never touched."""
+        out = []
+        for pos in journal.open_positions():
+            out.append(self.close_now(pos["symbol"], why))
+        return out
+
+    def set_capital(self, value: float | None) -> dict:
+        """Change the book the bot sizes against.
+
+        IMPORTANT and easy to misread: this does NOT move money on the exchange.
+        Bybit gives a demo account a fixed balance and its API has no "set balance
+        to X" call, so `set_capital(100)` makes the bot trade AS IF it had $100 —
+        every position size, the exposure cap and the daily kill-switch run off that
+        figure — while the exchange balance stays whatever Bybit says it is.
+        `None` = go back to managing the whole account balance.
+        """
+        global BYBIT_CAPITAL
+        if self.mode != "bybit":
+            return {"ok": False, "msg": f"capital sirf bybit mode me set hota hai (abhi: {self.mode})"}
+        if value is not None and value <= 0:
+            return {"ok": False, "msg": "capital 0 se bada hona chahiye"}
+
+        BYBIT_CAPITAL = None if value is None else float(value)
+        if self.ex is not None:
+            self.real_equity = self.ex.equity() or self.real_equity
+        # Re-anchor: the new book starts NOW, so past PnL isn't double-counted into it.
+        self._real_start = self.real_equity
+        self.equity = self._book_equity()
+        self.start_equity = BYBIT_CAPITAL if BYBIT_CAPITAL is not None else self._real_start
+        was_halted = self.risk.halted          # a resize must not quietly cancel a kill-switch
+        self.risk.start_equity = self.start_equity
+        self.risk.day_start_equity = self.equity
+        self.risk.update_equity(self.equity)
+        self.risk.halted = was_halted
+        self._save_capital()
+
+        if BYBIT_CAPITAL is None:
+            msg = f"Ab bot PURA account manage karega (balance ${self.real_equity:,.2f})"
+        else:
+            msg = (f"Trading capital set to ${BYBIT_CAPITAL:,.2f}. "
+                   f"Exchange balance ${self.real_equity:,.2f} waisa hi hai (Bybit demo "
+                   f"balance API se badla nahi ja sakta) — bot ab ${BYBIT_CAPITAL:,.0f} "
+                   f"ke account jaisa size, risk aur kill-switch use karega.")
+        _log(f"CAPITAL -> {BYBIT_CAPITAL if BYBIT_CAPITAL is not None else 'full account'} (operator)")
+        self._activity(f"OPERATOR set trading capital -> "
+                       f"{'full account' if BYBIT_CAPITAL is None else f'${BYBIT_CAPITAL:,.0f}'}")
+        return {"ok": True, "capital": BYBIT_CAPITAL, "real_balance": round(self.real_equity, 2),
+                "msg": msg}
+
+    def _save_capital(self) -> None:
+        """Persist the override immediately (not only on the next tick) so a crash or
+        redeploy right after the command doesn't lose it."""
+        st = {}
+        if STATE_PATH.exists():
+            try:
+                st = json.loads(STATE_PATH.read_text())
+            except Exception:  # noqa: BLE001
+                st = {}
+        st["capital_override"] = "full" if BYBIT_CAPITAL is None else BYBIT_CAPITAL
+        st["bybit_real_start"] = self._real_start
+        try:
+            STATE_PATH.write_text(json.dumps(st, indent=2))
+        except Exception as e:  # noqa: BLE001
+            _log(f"[capital] could not persist override: {e}")
 
     # ---- venue ownership ----
     def _owns(self, pos: dict) -> bool:
