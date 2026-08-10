@@ -175,7 +175,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div style="color:#8b949e;font-size:12px;margin-bottom:6px" id="scaninfo">--</div>
    <div id="activity" style="height:150px;overflow:auto;font-size:12px;font-family:Consolas,monospace"></div></div>
  <div class="card"><h2>👀 Watching now (crypto scan)</h2>
-   <table id="watch"><thead><tr><th>Coin</th><th>Regime</th><th>Score</th><th>Setup</th><th>RSI</th><th>ADX</th><th>Signal</th><th>ML</th></tr></thead><tbody></tbody></table></div>
+   <table id="watch"><thead><tr><th>Coin</th><th>Regime</th><th>Setup</th><th>RSI</th><th>ADX</th><th>Signal</th><th>Win%</th><th>RR</th><th>EV</th></tr></thead><tbody></tbody></table></div>
  <div class="card"><h2>📰 Crypto news (learning input)</h2><div id="news" style="height:200px;overflow:auto;font-size:12px"></div></div>
  <div class="card full"><h2>Trade history</h2><table id="hist"><thead><tr>
    <th>Time</th><th>Sym</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>R</th><th>Why / Lesson</th>
@@ -231,11 +231,15 @@ async function refresh(){
  let wb=document.querySelector('#watch tbody');wb.innerHTML='';
  (s.watching||[]).forEach(w=>{let col=w.regime.indexOf('UP')>=0?'green':(w.regime.indexOf('DOWN')>=0?'red':'');
    let sc=w.score||0;let scol=sc>=70?'green':(sc>=40?'':'#8b949e');
+   // EV is the number the entry gate actually uses: win-prob x reward:risk, minus
+   // the risk. Green = above the live threshold, i.e. this one is tradeable.
+   let ev=w.ev;let ec=(ev==null)?'':(ev>=0.25?'green':(ev>0?'':'red'));
    wb.innerHTML+='<tr><td>'+w.symbol+'</td><td class="'+col+'">'+w.regime+'</td>'+
-   '<td style="color:'+(scol||'inherit')+';font-weight:600">'+sc+'</td>'+
    '<td style="font-size:11px">'+(w.setup||'-')+'</td><td>'+w.rsi+'</td><td>'+w.adx+'</td><td>'+
-   (w.signal?'<b>'+w.signal+'</b>':'-')+'</td><td>'+(w.ml!=null?w.ml:'-')+'</td></tr>'});
- if(!s.watching||!s.watching.length)wb.innerHTML='<tr><td colspan=8>warming up…</td></tr>';
+   (w.signal?'<b>'+w.signal+'</b>':'-')+'</td><td>'+(w.ml!=null?Math.round(w.ml*100)+'%':'-')+'</td>'+
+   '<td>'+(w.rr!=null?w.rr:'-')+'</td>'+
+   '<td class="'+ec+'" style="font-weight:600">'+(ev!=null?(ev>0?'+':'')+ev:'-')+'</td></tr>'});
+ if(!s.watching||!s.watching.length)wb.innerHTML='<tr><td colspan=9>warming up…</td></tr>';
  let nb=document.getElementById('news');nb.innerHTML=(s.headlines||[]).map(h=>{
    let c=h.tag=='bull'?'green':(h.tag=='bear'?'red':'');return '<div style="margin-bottom:5px"><span class="'+c+'">['+h.tag+']</span> '+h.title+'</div>'}).join('');
  if(!s.headlines||!s.headlines.length)nb.innerHTML='(loading crypto news…)';

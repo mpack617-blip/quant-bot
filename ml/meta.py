@@ -39,6 +39,23 @@ FEATURE_COLS = [
     "rsi14", "atr_pct", "adx14", "macd_hist", "bb_pos", "vol20", "stoch_k",
 ]
 
+# What a CURRENT model trains on: the candle in front of it plus the situation it
+# fires into. Measured over a year of signals with a chronological split and costs,
+# the plain FEATURE_COLS set has no edge left; with context it does. See
+# research_edge.py / research_gate.py for the numbers.
+from features.context import CONTEXT_COLS  # noqa: E402
+MODEL_COLS = FEATURE_COLS + CONTEXT_COLS + ["side"]
+
+
+def expected_value(prob: float, rr: float) -> float:
+    """What this setup is worth, in R, if the model's probability is honest.
+
+    This is the number to gate on, not the probability. A 40% shot paying 3:1 is a
+    better trade than a 55% shot paying 1:1, and a flat P(win) threshold cannot tell
+    them apart — it throws away exactly the trades that pay for the losers.
+    """
+    return prob * rr - (1.0 - prob)
+
 
 def _signal_outcome(h, low, c, entry_bar, side, stop, target, max_hold) -> int | None:
     """Simulate one signal forward: 1 = target hit first, 0 = stop hit first.
@@ -148,10 +165,14 @@ def walk_forward_eval(X, y, pnls, *, folds: int = 4, threshold: float = 0.5) -> 
 
 
 def train_final(X, y) -> HistGradientBoostingClassifier:
-    """Train on ALL data and persist — this is the live model."""
+    """Train on ALL data and persist — this is the live model.
+
+    The column list is taken from X itself, not from a constant: a model saved with
+    a feature list it wasn't trained on scores garbage at runtime, silently.
+    """
     m = _new_model().fit(X, y)
     with open(MODEL_PATH, "wb") as f:
-        pickle.dump({"model": m, "features": FEATURE_COLS}, f)
+        pickle.dump({"model": m, "features": list(X.columns)}, f)
     return m
 
 

@@ -26,7 +26,8 @@ from strategies import multi_angle, opportunity_snapshot
 from strategies.snapback import generate_signals as snapback
 from strategies.continuation import combined_signals
 from strategies.range_fade import generate_signals as range_fade
-from ml.meta import predict_proba, FEATURE_COLS
+from ml.meta import predict_proba, FEATURE_COLS, expected_value
+from features.context import bar_context, signal_context, BAR_CONTEXT_COLS
 from ml.forecast import forecast as next_move, MODEL_INTERVAL
 from features.microstructure import snapshot as ms_snapshot
 from brokers import TradingViewBroker
@@ -75,20 +76,44 @@ RANGE_PARAMS = dict(adx_max=18.0, atr_stop=1.2, min_rr=0.6, min_stretch=0.3, wic
 USE_TRAIL = True        # trailing stop ON (user 2026-06-12): once a trade is +1R, stop moves to
                         # breakeven then trails by ATR — locks profit, lets winners run, turns
                         # would-be losers into break-even. The conviction target is the ceiling.
-# ML gate RESTORED 2026-08-06 (user: "profit chahiye, loss minimum, accuracy high").
-# Measured walk-forward on the 59-coin universe, 3,045 out-of-sample signals
-# (tune_accuracy.py) — every loss is exactly -1.00R by construction, so the only
-# things that move are win-rate and payoff:
-#     thr 0.00 (the old "trade everything")  36.8% win  PF 0.98  -0.011R  <- LOSES
-#     thr 0.45                               49.1% win  PF 1.42  +0.216R
-#     thr 0.50                               51.1% win  PF 1.53  +0.258R
-#     thr 0.60  <- chosen                    55.3% win  PF 1.93  +0.414R  1.7 trades/day
-#     thr 0.70                               56.8% win  PF 2.29  +0.556R  but 0.35/day
-#                                                                          (44 trades = too
-#                                                                           thin to trust)
-# 0.60 is the best point that still clears the user's "at least one trade a day".
-# Going higher buys a little more edge and loses most of the activity.
-ML_MIN_PROB = 0.60
+# THE ENTRY GATE — expected value, not win probability (2026-08-10).
+#
+# The old gate was `P(win) >= 0.60`, chosen from a walk-forward that reported 55%
+# win / PF 1.93. Re-measured properly, those numbers were not real. Two flaws:
+#   1. the folds were split by ROW ORDER, and rows were stacked coin after coin, so
+#      "train on the past" was really "train on the first N coins" — the training
+#      set contained bars from later in time than the test rows;
+#   2. fees and slippage were not subtracted, and they cost ~0.1R per trade.
+# Fixed both (chronological split, 48-bar embargo for overlapping labels, costs in)
+# and re-ran on 9,652 signals across 374 days: P(win)>=0.60 earns +0.037R/trade at
+# 0.9 trades a day. Essentially nothing.
+#
+# What does work is gating on EXPECTED VALUE, EV = p*RR - (1-p), with the model fed
+# the CONTEXT of each setup (features/context.py). Same data, same discipline:
+#     EV >= 0.15   41.0% win  PF 1.06  +0.037R   4.7 trades/day
+#     EV >= 0.20   42.1% win  PF 1.11  +0.071R   3.6 trades/day
+#     EV >= 0.25   43.0% win  PF 1.16  +0.099R   2.8 trades/day   <- chosen
+#     EV >= 0.30   43.1% win  PF 1.18  +0.114R   2.2 trades/day
+#     EV >= 0.40   39.5% win  PF 1.04  +0.028R   1.4 trades/day
+# 0.25 has the best R/day and is positive in BOTH halves of the period (PF 1.32 in
+# the first, 1.11 in the second) — it is not one lucky regime. The same EV gate on
+# the OLD feature set fails the second half, so the context features are the edge,
+# not the gate alone.
+#
+# Why EV beats a probability threshold: a 40% shot paying 3:1 is a better trade than
+# a 55% shot paying 1:1, and a flat P(win) cut cannot tell them apart — it discards
+# exactly the trades whose payoff covers the losers. Expect a LOWER win-rate than
+# the old gate claimed (~43%) and a positive expectancy, which is what compounds.
+EV_MIN = 0.25
+ML_MIN_PROB = 0.0       # superseded by EV_MIN; kept so old configs don't break
+# Sanity bounds on a setup that has aged since it fired (see _score). Not tuned for
+# edge — a stop-distance floor WAS tested as a filter and helped one half of the
+# year while hurting the other, so it is deliberately set low enough to reject only
+# the degenerate cases, not to select trades.
+MIN_STOP_PCT = 0.004    # 0.4% — below the 1st percentile of a year of real setups
+MIN_STOP_ATR = 0.30     # a stop closer than a third of an ATR is inside the noise
+RR_CAP = 3.0            # the widest reward:risk the model has ever been trained on
+STALE_EV = -9.0         # sentinel: "this setup is no longer tradeable"
 DECISION_INTERVAL = "1h"
 SIGNAL_BARS = 500
 SIGNAL_FRESH_BARS = 2   # a setup from the last N closed bars still counts if price is still in play
@@ -295,6 +320,7 @@ class QuantRunner:
         self.forecasts: list[dict] = []     # the bot's read on the NEXT move, per coin
         self._fc_cache: dict[str, object] = {}   # per-tick memo (cleared each tick)
         self._orphans: set[str] = set()     # open positions belonging to a DIFFERENT venue
+        self._btc_df = None                 # BTC candles for context features (per tick)
 
     # ---- persistence ----
     def _load_equity(self, default: float) -> float:
@@ -736,6 +762,40 @@ class QuantRunner:
         return float(max(-1.0, min(1.0, 0.6 * model_term + 0.4 * ms_term)))
 
     # ---- entry ----
+    def _score(self, df, feats, a, sig) -> tuple[float, float, float]:
+        """(win probability, natural reward:risk, expected value in R) for a setup.
+
+        One function so the number shown on the dashboard is exactly the number the
+        entry gate uses — the "it showed a signal but didn't trade" confusion came
+        from those two being computed in different places.
+
+        STALE SETUPS. A signal from an earlier bar is still valid while price sits
+        between its stop and target, but if price has drifted almost onto the stop,
+        the remaining risk is a rounding error and the reward:risk explodes — a live
+        ETH setup priced out at 32:1, while the widest RR in a year of training data
+        is 3:1. Trading that is not "high reward", it is a stop sitting inside the
+        spread, and fees alone (2*cost/stop_pct) would cost several R. Those are
+        rejected, and RR is capped at what the model was actually trained on.
+        """
+        price = float(df["close"].iloc[-1])
+        stop_d = abs(price - sig.stop)
+        atr_now = float(a.iloc[-1]) if len(a) else 0.0
+        rr = abs(sig.target - price) / stop_d if stop_d else 0.0
+        if (stop_d <= 0 or stop_d / price < MIN_STOP_PCT
+                or (atr_now and stop_d / atr_now < MIN_STOP_ATR)):
+            return 0.0, rr, STALE_EV
+        row = feats.iloc[-1][FEATURE_COLS].to_dict()
+        try:
+            ctx = bar_context(df, feats, self._btc_df).iloc[-1]
+            row.update({k: ctx[k] for k in BAR_CONTEXT_COLS})
+            row.update(signal_context(sig, price, float(a.iloc[-1]), ctx["btc_above_ema50"]))
+        except Exception as e:  # noqa: BLE001
+            # Context is what gives the model its edge, but a failure here must not
+            # stop trading: the missing columns arrive as NaN, which the model handles.
+            _log(f"[context] {e}")
+        prob = predict_proba(row, sig.side)
+        return prob, rr, expected_value(prob, min(rr, RR_CAP))
+
     def _try_enter(self, sym: str, df, feats, a, sentiment, sig) -> None:
         if not config.is_crypto_symbol(sym):   # CRYPTO ONLY (locked per user)
             return
@@ -746,10 +806,13 @@ class QuantRunner:
         price = float(df["close"].iloc[-1])
         if market.blocks(self.mkt_bias, sig.side):   # don't fight BTC's decisive trend
             return
-        feat_row = feats.iloc[-1][FEATURE_COLS].to_dict()
 
-        prob = predict_proba(feat_row, sig.side)
-        if prob < ML_MIN_PROB:
+        # THE ENTRY GATE: expected value, not raw win probability. Measured over a
+        # year of signals (chronological split, costs included): gating on P(win)
+        # is break-even at best, gating on EV is positive in both halves of the
+        # period. See research_edge.py / research_gate.py.
+        prob, natural_rr, ev = self._score(df, feats, a, sig)
+        if ev < EV_MIN:
             return
         ok_news, news_reason = news.agrees_with(sym, sig.side)
         if not ok_news or sentiment.risk_off:
@@ -778,8 +841,6 @@ class QuantRunner:
         # Conviction (ML win-prob + trend strength + natural RR) sets the dollar risk
         # (-> quantity), a slightly tighter stop, and a further-out target on the trades
         # it rates highly. Loss stays limited; the planned win is always >= $1.
-        stop_d0 = abs(price - sig.stop)
-        natural_rr = abs(sig.target - price) / stop_d0 if stop_d0 else 0.0
         plan = conviction.assess(prob=prob, adx=float(feats.iloc[-1]["adx14"]),
                                  natural_rr=natural_rr, side=sig.side,
                                  entry=price, stop=sig.stop, fwd_agree=fwd_agree,
@@ -943,6 +1004,14 @@ class QuantRunner:
         self.risk.update_equity(self.equity)
         sentiment = news.market_sentiment()
         self.mkt_bias = market.current_bias(DECISION_INTERVAL)   # don't fight BTC's trend
+        # BTC candles once per tick: every coin's context features are measured
+        # against the same market backdrop, and it is one fetch instead of 59.
+        try:
+            self._btc_df = get_klines_cached("BTCUSDT", DECISION_INTERVAL,
+                                             bars=SIGNAL_BARS, max_age_min=4)
+        except Exception as e:  # noqa: BLE001
+            self._btc_df = None
+            _log(f"[btc context] {e}")
         watching = []
         plans: list[dict] = []     # candidate trade plans to visualise on the TV chart
         for sym in config.UNIVERSE:
@@ -970,15 +1039,27 @@ class QuantRunner:
                 snap = opportunity_snapshot(df, feats, a)
                 entry = {"symbol": sym.replace("USDT", ""), "regime": regime,
                          "rsi": round(float(row["rsi14"]), 0), "adx": round(float(row["adx14"]), 0),
-                         "signal": None, "ml": None,
+                         "signal": None, "ml": None, "ev": None, "rr": None,
                          "setup": snap["setup"], "score": snap["score"]}
                 if sig is not None:
                     entry["signal"] = "LONG" if sig.side == 1 else "SHORT"
-                    entry["ml"] = round(predict_proba(e_feats.iloc[-1][FEATURE_COLS].to_dict(), sig.side), 2)
+                    # Same call the entry gate makes, so the board can never show a
+                    # number the decision didn't use.
+                    p_, rr_, ev_ = self._score(e_df, e_feats, e_a, sig)
+                    entry["ml"] = round(p_, 2)
+                    entry["rr"] = round(rr_, 2)
+                    entry["ev"] = round(ev_, 2)
                     setup_tag = sig.reason.split(":")[0]
                     entry["setup"] = setup_tag           # show the ACTUAL firing setup, not the multi_angle proxy
+                    if ev_ == STALE_EV:
+                        why = "price already at its stop - setup expired"
+                    elif ev_ >= EV_MIN:
+                        why = f"win {p_*100:.0f}% x {min(rr_, RR_CAP):.1f}R -> EV {ev_:+.2f}"
+                    else:
+                        why = (f"win {p_*100:.0f}% x {min(rr_, RR_CAP):.1f}R -> "
+                               f"EV {ev_:+.2f} < {EV_MIN} skip")
                     self._activity(f"SIGNAL {setup_tag} {entry['symbol']} "
-                                   f"(ADX {entry['adx']:.0f}, RSI {entry['rsi']:.0f}, ML {entry['ml']})")
+                                   f"(ADX {entry['adx']:.0f}, RSI {entry['rsi']:.0f}, {why})")
                     plans.append({"sym": sym, "side": sig.side, "entry": e_price,
                                   "stop": sig.stop, "target": sig.target, "label": setup_tag,
                                   "score": snap["score"]})

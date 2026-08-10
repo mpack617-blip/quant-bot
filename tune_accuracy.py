@@ -1,5 +1,14 @@
 """What does each ML threshold actually buy you? Win rate, payoff, frequency.
 
+SUPERSEDED 2026-08-10 — DO NOT STEER BY THESE NUMBERS. Two flaws were found:
+  1. Signals are stacked coin after coin and the folds split by ROW ORDER, so
+     "train on the past" is really "train on the first N coins" and the training
+     set contains bars from LATER in time than the test rows.
+  2. Fees and slippage are not subtracted; they cost ~0.075R per trade.
+Together those turned a break-even filter into an apparent "PF 1.93". Use
+`research_edge.py` (chronological split, label embargo, costs) instead. This file
+is kept only to reproduce the old figures.
+
 The ask is always "more accuracy, tiny losses, big wins". You cannot max all three
 at once — every point of extra win-rate is paid for in trades skipped, and every
 dollar of extra payoff is paid for in win-rate. This script measures that curve on
