@@ -17,7 +17,9 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python cockpit.py
-    healthCheckPath: /api/status
+    # /healthz is the one route outside the password lock — a health check has no
+    # session, so pointing this at a locked route would fail the deploy.
+    healthCheckPath: /healthz
     envVars:
       - key: QUANT_MODE
         value: bybit
@@ -39,8 +41,12 @@ services:
         sync: false
       - key: BYBIT_API_SECRET
         sync: false
-      # Password for the cockpit's WRITE actions (close positions, change capital,
-      # stop the bot). This dashboard is on a public URL, so until this is set the
-      # cockpit is read-only: it fails closed, never open. Reading is always free.
+      # Password for the WHOLE cockpit. Set it in the dashboard, never here (this
+      # repo is public). Entered once in the browser, then kept in a signed session
+      # cookie for 30 days. Until it is set, a public deploy serves nothing at all.
+      - key: QUANT_PASSWORD
+        sync: false
+      # Optional: a header token (X-Cmd-Token) so scripts/curl can call the command
+      # API without a browser session. Not needed for normal use.
       - key: QUANT_CMD_TOKEN
         sync: false

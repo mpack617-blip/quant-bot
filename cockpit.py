@@ -8,7 +8,8 @@ http://localhost:8787
 """
 from __future__ import annotations
 
-from flask import Flask, jsonify, request, send_file, abort
+from flask import (Flask, jsonify, request, send_file, abort, session,
+                   redirect, url_for)
 
 import journal
 import chat as chat_brain
@@ -19,31 +20,110 @@ import os
 
 app = Flask(__name__)
 
-# --- who may CHANGE things -----------------------------------------------------
-# Reading the dashboard is harmless. Closing positions, resizing the book or
-# stopping the bot are not — and on Render this cockpit is on the public internet,
-# where anyone with the URL could hit these endpoints. So:
-#   * running locally  -> trusted, no password needed.
-#   * public (PORT set by the host) -> QUANT_CMD_TOKEN must be set AND supplied,
-#     otherwise write endpoints are refused outright. Failing closed is the point:
-#     a public deploy with no token gets a read-only cockpit, not an open one.
+# --- site lock -----------------------------------------------------------------
+# This cockpit is on a public URL: anyone with the link could read the account and
+# close positions. So the WHOLE site sits behind one password, entered once and
+# then remembered in a signed session cookie.
+#
+# The password lives ONLY in the environment (QUANT_PASSWORD) — never in this repo,
+# which is public. No password set + public host = the site refuses to serve rather
+# than serving openly; failing closed is the whole point of a lock.
+#
+# QUANT_CMD_TOKEN stays as an optional header token so scripts/curl can drive the
+# command API without a browser session.
+PASSWORD = os.environ.get("QUANT_PASSWORD", "").strip()
 CMD_TOKEN = os.environ.get("QUANT_CMD_TOKEN", "").strip()
 IS_PUBLIC = bool(os.environ.get("PORT") or os.environ.get("RENDER_EXTERNAL_URL"))
+LOCKED = bool(PASSWORD)
+
+# Signing key for the session cookie. Derived from the password when no explicit
+# key is given, so the cookie survives restarts and redeploys (otherwise every
+# deploy would silently log the user out) without needing a second secret.
+import hashlib as _hashlib
+app.secret_key = (os.environ.get("QUANT_SECRET")
+                  or (_hashlib.sha256(("quant-cockpit:" + PASSWORD).encode()).hexdigest()
+                      if PASSWORD else os.urandom(24).hex()))
+app.permanent_session_lifetime = __import__("datetime").timedelta(days=30)
+
+# Reachable without logging in: the login page itself, and a health endpoint —
+# Render's health check and the keep-awake ping are not a browser and have no
+# session, and a 401 there would mark the deploy unhealthy and kill the service.
+OPEN_PATHS = {"/login", "/healthz", "/favicon.ico"}
+
+
+def _logged_in() -> bool:
+    return bool(session.get("auth")) or not LOCKED and not IS_PUBLIC
+
+
+@app.before_request
+def _gate():
+    if request.path in OPEN_PATHS:
+        return None
+    if not LOCKED:
+        # No password configured. Locally that's fine (own machine); on a public
+        # host serve nothing rather than serve everything.
+        if IS_PUBLIC:
+            return ("Cockpit locked: set QUANT_PASSWORD in the host environment.", 503)
+        return None
+    if session.get("auth"):
+        return None
+    if CMD_TOKEN and request.headers.get("X-Cmd-Token") == CMD_TOKEN:
+        return None                      # script access, no browser session
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "login required"}), 401
+    return redirect(url_for("login"))
+
+
+LOGIN_PAGE = """<!doctype html><meta charset="utf-8"><title>Quant-Bot — locked</title>
+<style>body{font-family:Segoe UI,Arial;background:#0d1117;color:#e6edf3;display:flex;
+ align-items:center;justify-content:center;height:100vh;margin:0}
+form{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:28px;width:320px}
+h1{font-size:17px;margin:0 0 4px}p{color:#8b949e;font-size:12px;margin:0 0 16px}
+input{width:100%;padding:10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;
+ color:#e6edf3;box-sizing:border-box;margin-bottom:10px}
+button{width:100%;padding:10px;border:0;border-radius:6px;background:#238636;color:#fff;
+ font-weight:600;cursor:pointer}.err{color:#f85149;font-size:12px;margin-bottom:8px}</style>
+<form method="post"><h1>⚡ Quant-Bot Cockpit</h1>
+<p>Password daalo — ek baar, phir 30 din yaad rahega.</p>
+__ERR__<input type="password" name="password" placeholder="password" autofocus>
+<button>Unlock</button></form>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not LOCKED:
+        return redirect("/")
+    if request.method == "POST":
+        if (request.form.get("password") or "") == PASSWORD:
+            session.permanent = True     # survive the browser being closed
+            session["auth"] = True
+            return redirect("/")
+        return LOGIN_PAGE.replace("__ERR__", '<div class="err">Galat password.</div>'), 401
+    return LOGIN_PAGE.replace("__ERR__", "")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/healthz")
+def healthz():
+    """Unauthenticated liveness probe — deliberately exposes nothing but a flag."""
+    return jsonify({"ok": True, "running": RUNNER.running})
 
 
 def _auth(req) -> tuple[bool, str]:
-    if not IS_PUBLIC and not CMD_TOKEN:
+    """May this request CHANGE something? Past the site lock a browser session is
+    already proof of the password, so a logged-in operator needs nothing extra."""
+    if session.get("auth"):
         return True, ""
-    if not CMD_TOKEN:
-        return False, ("Ye cockpit public URL pe hai aur koi password set nahi hai, "
-                       "isliye commands band hain. Render → Environment me "
-                       "QUANT_CMD_TOKEN set karo, phir yahan wahi password daalo.")
-    supplied = (req.headers.get("X-Cmd-Token")
-                or (req.get_json(silent=True) or {}).get("token")
-                or req.args.get("token") or "")
-    if supplied == CMD_TOKEN:
+    if CMD_TOKEN and req.headers.get("X-Cmd-Token") == CMD_TOKEN:
         return True, ""
-    return False, "🔒 Galat ya missing password — command nahi chalayi."
+    if not LOCKED and not IS_PUBLIC:
+        return True, ""                  # local machine, no lock configured
+    return False, "🔒 Login chahiye — page reload karke password daalo."
 # Default to the live TradingView paper account (the user attached the bot to it).
 # Set QUANT_MODE=paper to use the internal $1000 simulator instead.
 RUNNER = QuantRunner(mode=os.environ.get("QUANT_MODE", "tradingview"))
@@ -74,7 +154,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <header><h1>⚡ Quant-Bot Cockpit <span id="modetag" style="color:#8b949e;font-size:12px">…</span></h1>
  <div><span id="rstate" class="pill off">STOPPED</span>
- <button id="toggle" class="start" onclick="toggle()">START</button></div></header>
+ <button id="toggle" class="start" onclick="toggle()">START</button>
+ <a href="/logout" style="color:#8b949e;font-size:12px;margin-left:10px">logout</a></div></header>
 <div class="wrap">
  <div class="card"><h2>Equity</h2><div class="big" id="equity">--</div>
    <div id="pnl">--</div><div style="color:#8b949e" id="dd">--</div></div>
@@ -104,11 +185,6 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <input id="q" placeholder="pucho: 'pnl kitna hai' &nbsp;|&nbsp; bolo: 'sab position close kar do', 'balance 100 usdt kar do'"
      onkeydown="if(event.key=='Enter')send()">
    <button class="start" onclick="send()">Send</button>
-   <div id="authrow" style="margin-top:8px;display:none">
-     <input id="tok" type="password" style="width:40%" placeholder="command password (QUANT_CMD_TOKEN)"
-       oninput="localStorage.setItem('cmdtok',this.value)">
-     <span style="color:#8b949e;font-size:11px">— sirf change karne wale commands ke liye; sawaal free hain</span>
-   </div>
    <div style="color:#8b949e;font-size:11px;margin-top:6px">
      Commands: "sab position close kar do" · "ZRO close kar do" · "balance 100 usdt kar do" ·
      "capital full kar do" · "bot band kar do" / "bot start karo" · "help".
@@ -116,7 +192,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </div>
 <script>
 async function refresh(){
- let s=await (await fetch('/api/status')).json();
+ let sr=await fetch('/api/status');
+ if(sr.status==401){location.href='/login';return}   // session expired -> ask again
+ let s=await sr.json();
  rstate.textContent=s.running?'RUNNING':'STOPPED';
  rstate.className='pill '+(s.running?'on':'off');
  toggle.textContent=s.running?'STOP':'START';toggle.className=s.running?'stop':'start';
@@ -143,10 +221,6 @@ async function refresh(){
  } else mt.textContent=s.mode=='tradingview'?'TradingView paper account':'internal simulator';
  let ms=s.market_sentiment||{};senti.textContent='News sentiment '+ms.score+(ms.risk_off?' (RISK-OFF)':'');
  scaninfo.textContent='Scans done: '+(s.scans||0)+'  |  crypto-only  |  '+(s.last_note||'');
- let ar=document.getElementById('authrow');
- if(s.cmd_auth=='token'){ar.style.display='block';let t=document.getElementById('tok');
-   if(!t.value){let sv=localStorage.getItem('cmdtok');if(sv)t.value=sv}}
- else ar.style.display='none';
  let af=document.getElementById('activity');af.innerHTML=(s.activity||['(warming up...)']).map(a=>'• '+a).join('<br>');
  let tv=s.tv_view||{};let ti=document.getElementById('tvinfo');let tg=document.getElementById('tvimg');
  if(tv.shot){let k={TRADE:'🟢 IN TRADE',SETUP:'🎯 SETUP',WATCH:'👁️ WATCHING'}[tv.kind]||'';
@@ -191,17 +265,17 @@ async function refresh(){
    (t.postmortem||t.exit_reason||'')+'</td></tr>'});
  if(!h.length)hb.innerHTML='<tr><td colspan=8>No trades yet.</td></tr>';
 }
-function tok(){let t=document.getElementById('tok');return t?t.value:''}
 async function toggle(){let s=await (await fetch('/api/status')).json();
  let r=await fetch(s.running?'/api/stop':'/api/start',{method:'POST',
-   headers:{'Content-Type':'application/json','X-Cmd-Token':tok()},body:'{}'});
- if(r.status==403){let e=await r.json();alert(e.error)}
+   headers:{'Content-Type':'application/json'},body:'{}'});
+ if(r.status==403||r.status==401){location.href='/login'}
  setTimeout(refresh,400)}
 async function send(){let q=document.getElementById('q');if(!q.value)return;
  chat.innerHTML+='<div class="u">You: '+q.value+'</div>';let question=q.value;q.value='';
- let r=await (await fetch('/api/chat',{method:'POST',
-   headers:{'Content-Type':'application/json','X-Cmd-Token':tok()},
-   body:JSON.stringify({q:question,token:tok()})})).json();
+ let resp=await fetch('/api/chat',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify({q:question})});
+ if(resp.status==401){location.href='/login';return}
+ let r=await resp.json();
  chat.innerHTML+='<div class="b">Bot ('+r.engine+'): '+r.answer.replace(/\\n/g,'<br>')+'</div>';
  chat.scrollTop=chat.scrollHeight;
  if((r.engine||'').indexOf('command')==0)setTimeout(refresh,800)}
@@ -245,7 +319,7 @@ def status():
         "manages_full_account": (RUNNER.mode == "bybit"
                                  and __import__("runner").BYBIT_CAPITAL is None),
         "real_balance": round(RUNNER.real_equity, 2) if RUNNER.mode == "bybit" else None,
-        "cmd_auth": "token" if (IS_PUBLIC or CMD_TOKEN) else "open",
+        "locked": LOCKED,
     })
 
 
@@ -397,7 +471,9 @@ def _keep_awake() -> None:
         while True:
             time.sleep(600)
             try:
-                urllib.request.urlopen(f"{url.rstrip('/')}/api/status", timeout=20).read(1)
+                # /healthz, not /api/status: the site lock would 401 the ping, and a
+                # ping that only ever gets rejected is a poor liveness signal.
+                urllib.request.urlopen(f"{url.rstrip('/')}/healthz", timeout=20).read(1)
             except Exception as e:  # noqa: BLE001
                 print(f"[keep-awake] ping failed: {e}")
 
