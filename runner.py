@@ -229,6 +229,14 @@ BYBIT_RISK = {
     # good setups cluster, and a cap of 3 would silently drop most of them. At ~1% risk
     # per trade this still caps total risk at roughly 8% of the account.
     "max_concurrent_positions": 8,
+    # ...but no more than 5 of them may point the SAME WAY. Alts are highly correlated,
+    # so 8 shorts is nearly one 8x short: on 2026-08-11 all eight live trades were shorts
+    # and all eight stopped. Measured over 373 days / 1,791 gated signals, capping the
+    # same side at 5 leaves per-trade expectancy almost unchanged (+0.660R -> +0.629R)
+    # but cuts the worst day from -7.4R to -5.3R and max drawdown from -13.9R to -10.0R.
+    # -7.4R at 1% risk per trade is -7.4% in a day, which trips the 6% kill-switch below;
+    # the cap keeps a bad day inside the budget instead of ending the trading day.
+    "max_same_side_positions": 5,
     "max_daily_drawdown_pct": 6.0,    # real money: halt the day much sooner
     "default_leverage": 5,
     "max_loss_usd": 0.80,
@@ -323,6 +331,7 @@ class QuantRunner:
         self._orphans: set[str] = set()     # open positions belonging to a DIFFERENT venue
         self._btc_df = None                 # BTC candles for context features (per tick)
         self.chart: dict = {}               # the annotated chart the bot is reading
+        self._last_row: dict = {}           # feature row from the most recent _score()
 
     # ---- persistence ----
     def _load_equity(self, default: float) -> float:
@@ -840,6 +849,11 @@ class QuantRunner:
         is 3:1. Trading that is not "high reward", it is a stop sitting inside the
         spread, and fees alone (2*cost/stop_pct) would cost several R. Those are
         rejected, and RR is capped at what the model was actually trained on.
+
+        The exact feature row that produced the score is left in `self._last_row`
+        so the caller can journal it as the trade's entry context. It is the same row
+        the model saw — a post-mortem written from a re-derived row would be
+        describing a slightly different trade.
         """
         price = float(df["close"].iloc[-1])
         stop_d = abs(price - sig.stop)
@@ -847,6 +861,7 @@ class QuantRunner:
         rr = abs(sig.target - price) / stop_d if stop_d else 0.0
         if (stop_d <= 0 or stop_d / price < MIN_STOP_PCT
                 or (atr_now and stop_d / atr_now < MIN_STOP_ATR)):
+            self._last_row = {}
             return 0.0, rr, STALE_EV
         row = feats.iloc[-1][FEATURE_COLS].to_dict()
         try:
@@ -858,6 +873,7 @@ class QuantRunner:
             # stop trading: the missing columns arrive as NaN, which the model handles.
             _log(f"[context] {e}")
         prob = predict_proba(row, sig.side)
+        self._last_row = row
         return prob, rr, expected_value(prob, min(rr, RR_CAP))
 
     def _try_enter(self, sym: str, df, feats, a, sentiment, sig) -> None:
@@ -876,6 +892,9 @@ class QuantRunner:
         # is break-even at best, gating on EV is positive in both halves of the
         # period. See research_edge.py / research_gate.py.
         prob, natural_rr, ev = self._score(df, feats, a, sig)
+        # The row the model actually scored — journalled below as the trade's entry
+        # context, which is what the loss post-mortems and the next ML retrain read.
+        feat_row = dict(self._last_row)
         if ev < EV_MIN:
             return
         ok_news, news_reason = news.agrees_with(sym, sig.side)
@@ -922,6 +941,10 @@ class QuantRunner:
                                       open_positions=journal.open_positions(),
                                       risk_usd=plan.risk_usd)
         if not decision.approved:
+            # Say WHY on the feed. A setup that cleared every other gate and then
+            # vanished silently is exactly the "it showed a signal but didn't trade"
+            # confusion; the risk manager's reason is the answer to it.
+            self._activity(f"SKIP {sym.replace('USDT','')} - {decision.reason}")
             return
 
         protected = False

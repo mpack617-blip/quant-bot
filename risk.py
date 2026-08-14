@@ -65,6 +65,34 @@ class RiskManager:
             return SizingDecision(False, 0, 0, 0,
                                   f"max concurrent positions ({self.cfg['max_concurrent_positions']}) reached")
 
+        # --- how much of the book may point the same way ---------------------
+        # Alts move together, so N simultaneous shorts are closer to one big short than
+        # to N independent bets. The concurrency cap alone doesn't see that: it happily
+        # allows 8 positions that are all the same side, and on 2026-08-11 all 8 live
+        # trades were shorts and all 8 stopped.
+        #
+        # This is a DRAWDOWN control, not an edge filter — measured on 1,791 gated
+        # signals over 373 days, per-trade expectancy barely moves (+0.660R uncapped
+        # vs +0.629R at a cap of 5) but the tail shrinks a lot:
+        #     cap  worst day   max DD   total R   totalR/DD
+        #     none    -7.4R    -13.9R     632       45.5
+        #        5    -5.3R    -10.0R     509       50.8   <- chosen
+        #        4    -4.2R     -9.0R     451       50.3
+        #        3    -3.6R     -7.9R     399       50.5
+        # The uncapped worst day (-7.4R ~ -7.4% at 1% risk) blows straight through the
+        # 6% daily kill-switch; a cap of 5 keeps it inside. The improvement is largest
+        # in the weaker half of the period (totalR/DD 20.1 -> 28.8), which is what a
+        # risk rule should do. The honest cost: ~20% less total R, because ~31% of
+        # entries fire into a book that already leans this way.
+        side_cap = self.cfg.get("max_same_side_positions")
+        if side_cap:
+            same = sum(1 for p in open_positions if p.get("side") == side)
+            if same >= side_cap:
+                direction = "long" if side == 1 else "short"
+                return SizingDecision(False, 0, 0, 0,
+                                      f"already {same} {direction} positions open "
+                                      f"(same-side cap {side_cap}) - not adding correlated risk")
+
         risk_per_unit = abs(entry - stop)
         if risk_per_unit <= 0:
             return SizingDecision(False, 0, 0, 0, "invalid stop (zero risk distance)")
