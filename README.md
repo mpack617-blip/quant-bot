@@ -20,6 +20,9 @@ forex-ready architecture. Testnet/paper before any real money.
         |
 [ Backtester ]      vectorised, with fees+slippage, walk-forward, out-of-sample, Monte-Carlo
         |
+[ Playbook ]        quality vetoes (stop width, HTF alignment, volatility, session)
+                    + the DAILY LOSS BUDGET — see playbook.py
+        |
 [ Risk Manager ]    position sizing, max DD limit, kill-switch, exposure caps
         |
 [ Execution ]       Bybit API (TESTNET first), order/position management, 24/7 runner
@@ -91,6 +94,43 @@ python train_forecast.py 15m 5000 4    # (re)train the next-move forecaster
 ```
 For natural-language chat install Ollama + `ollama pull llama3.2` (else rule-based chat works).
 
+## How it keeps the losing days small (playbook.py)
+
+Three layers, measured together over 197 days and 7,257 signals with a walk-forward
+gate (`python research_manage.py`), on identical entries:
+
+| | win rate | R / trade | days ending ≤1 loss | max drawdown |
+|---|---|---|---|---|
+| before (hold to target, BE stop at +1R, no day rules) | 29% | −0.018R | 24% | −175R |
+| after (playbook + partial + loss budget) | 80% | +0.321R | 98% | −11R |
+
+1. **Quality vetoes** — a stop closer than 1.25% of price, a trade against the
+   higher-timeframe trend, the bottom half of the volatility range, and entries after
+   17:00 UTC are each a measured negative-expectancy group. They are refused.
+2. **Bank a third at +0.5R, stop to breakeven** — the trade only has to be right once
+   instead of twice, and the reversal after that costs nothing instead of a full R.
+   This is what moves the win rate; the expectancy is unchanged.
+3. **The daily loss budget** — after the day's second loss, no new entries until
+   00:00 UTC; after any loss, a 4-hour cooldown. Losses cluster, so the trade right
+   after a loss is a measurably worse bet. This is the single largest effect in the
+   whole study.
+
+Every threshold is an env var (`QUANT_MAX_DAILY_LOSSES`, `QUANT_LOSS_COOLDOWN_H`,
+`QUANT_EV_MIN`, `QUANT_PARTIAL_R`, `QUANT_PARTIAL_FRAC`) so none of it needs a redeploy.
+
+## Where the equity number comes from
+
+The bot runs on a host with an **ephemeral disk**: every restart restores `journal.db`
+and `paper_state.json` to the copies in git. So neither the balance nor the trade
+history may be trusted to local state. Instead, on every tick the runner asks Bybit for
+every trade closed since `book_start_ms` (a fixed timestamp, the one thing that must
+survive a restart), refills the journal with anything missing, and computes
+
+    book equity = QUANT_CAPITAL + realised PnL since the anchor + unrealised PnL now
+
+The previous design anchored to a *balance* read at boot, which is why a losing account
+kept reporting exactly $100.00 with an empty trade table.
+
 ## Status
 Phases 0-3 done; Phase 4 (strategy) in progress. Run a backtest:
 `python run_backtest.py ALL 1h 1500`  (or `python run_backtest.py BTCUSDT 4h 2000`)
@@ -100,6 +140,8 @@ quant-bot/
   data/bybit.py            Bybit v5 data fetcher (public)
   features/indicators.py   custom indicator library + feature_frame
   strategies/              trading strategies (trend_pullback v1)
+  playbook.py              entry vetoes + the daily loss budget / cooldown
+  research_manage.py       the study behind them (walk-forward, both halves)
   backtest/engine.py       bar-by-bar sim: ATR stops, BE+trailing, fees
   backtest/metrics.py      Sharpe, maxDD, win-rate, profit-factor, expectancy
   run_backtest.py          CLI runner (single symbol or whole universe)

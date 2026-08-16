@@ -440,6 +440,31 @@ class BybitBroker:
                 return {"ok": True, "raw": "closed"}
         return {"ok": False, "raw": "close order sent but position still open"}
 
+    @staticmethod
+    def _norm_closed(r: dict) -> dict:
+        """One closed-PnL record in the runner's vocabulary.
+
+        DIRECTION. Bybit's `side` on this endpoint is the side of the CLOSING order,
+        not the position's — a closed long reports "Sell". Rather than depend on that
+        (and on it never changing), the direction is read from the arithmetic: a long
+        makes money when the exit is above the entry, a short when it is below. The
+        `side` field is only the fallback for the degenerate case where fees made the
+        PnL land on exactly zero.
+        """
+        entry = float(r.get("avgEntryPrice") or 0)
+        exit_px = float(r.get("avgExitPrice") or 0)
+        pnl = float(r.get("closedPnl") or 0)
+        move = exit_px - entry
+        if pnl and move:
+            side = 1 if (pnl > 0) == (move > 0) else -1
+        else:
+            side = -1 if str(r.get("side")) == "Buy" else 1   # closing Buy = was short
+        return {"symbol": r.get("symbol"), "side": side, "raw_side": r.get("side"),
+                "qty": float(r.get("qty") or 0), "entry": entry, "exit": exit_px,
+                "pnl": pnl, "closed_ms": int(r.get("updatedTime") or 0),
+                "order_id": r.get("orderId"),
+                "leverage": r.get("leverage"), "exec_type": r.get("execType")}
+
     def closed_pnl(self, symbol: str | None = None, limit: int = 20) -> list[dict]:
         """Realised PnL of recent closed trades — the honest record of what the
         exchange actually paid us (fees included), not our own estimate."""
@@ -448,13 +473,101 @@ class BybitBroker:
                                 {"category": self.category, "symbol": symbol, "limit": limit})
         except Exception:  # noqa: BLE001
             return []
-        return [{"symbol": r.get("symbol"), "side": r.get("side"),
-                 "qty": float(r.get("qty") or 0),
-                 "entry": float(r.get("avgEntryPrice") or 0),
-                 "exit": float(r.get("avgExitPrice") or 0),
-                 "pnl": float(r.get("closedPnl") or 0),
-                 "closed_ms": int(r.get("updatedTime") or 0)}
-                for r in (res.get("list") or [])]
+        return [self._norm_closed(r) for r in (res.get("list") or [])]
+
+    def closed_pnl_since(self, start_ms: int, max_pages: int = 12) -> list[dict]:
+        """Every closed trade since `start_ms`, oldest first — the durable record.
+
+        WHY THIS EXISTS. The bot runs on a host with an ephemeral disk: a restart
+        wipes journal.db and paper_state.json back to whatever is committed. The
+        exchange does not forget, so the account's real history is re-read from here
+        on every boot instead of being trusted to survive locally.
+
+        Bybit pages this endpoint newest-first with a cursor and caps a page at 100.
+        We walk back until a record predates the anchor (or the pages run out) — with
+        the default that is up to 1,200 trades, far more than this book will do.
+        """
+        out: list[dict] = []
+        cursor = None
+        for _ in range(max_pages):
+            params = {"category": self.category, "limit": 100, "cursor": cursor}
+            try:
+                res = self._request("GET", "/v5/position/closed-pnl", params)
+            except Exception:  # noqa: BLE001
+                break
+            page = res.get("list") or []
+            if not page:
+                break
+            stop = False
+            for r in page:
+                rec = self._norm_closed(r)
+                if rec["closed_ms"] < start_ms:
+                    stop = True
+                    continue
+                out.append(rec)
+            cursor = res.get("nextPageCursor")
+            if stop or not cursor:
+                break
+        out.sort(key=lambda r: r["closed_ms"])
+        return out
+
+    def realised_since(self, start_ms: int) -> float:
+        """Sum of realised PnL since the anchor. This is what makes the book's
+        equity reconstructible after any restart, without a persisted balance."""
+        return round(sum(r["pnl"] for r in self.closed_pnl_since(start_ms)), 6)
+
+    def unrealised(self) -> float:
+        """Open-position PnL right now (0.0 if the read fails — never guesses)."""
+        try:
+            return round(sum(p.get("unrealised", 0.0) for p in self.fetch_positions()), 6)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def reduce(self, sym: str, qty: float) -> dict:
+        """Close PART of a position with a reduce-only market order.
+
+        This is what makes a partial take-profit possible: bank half the trade at +1R
+        and let the rest run behind a breakeven stop. `close()` cannot do it — it
+        always flattens the whole position.
+        """
+        symbol = sym.split(":")[-1].upper()
+        pos = next((p for p in self.positions() if p["symbol"] == symbol), None)
+        if not pos:
+            return {"ok": False, "qty": 0.0, "raw": "no position"}
+        try:
+            inst = self.instrument(symbol)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "qty": 0.0, "raw": f"instrument: {e}"}
+        q = inst.round_qty(min(qty, pos["qty"]))
+        # Two ways a partial is not worth sending: it rounds to nothing, or it would
+        # leave a REMAINDER below the exchange minimum — that remainder could then
+        # never be closed by a normal order, stranding the position.
+        if q < inst.min_qty:
+            return {"ok": False, "qty": 0.0, "raw": f"partial {qty} below min qty {inst.min_qty}"}
+        if 0 < (pos["qty"] - q) < inst.min_qty:
+            return {"ok": False, "qty": 0.0,
+                    "raw": f"partial would strand a remainder below min qty {inst.min_qty}"}
+        try:
+            self._request("POST", "/v5/order/create", {
+                "category": self.category,
+                "symbol": symbol,
+                "side": "Sell" if pos["side"] == "long" else "Buy",
+                "orderType": "Market",
+                "qty": str(q),
+                "timeInForce": "IOC",
+                "positionIdx": 0,
+                "reduceOnly": True,
+            })
+        except BybitError as e:
+            return {"ok": False, "qty": 0.0, "raw": str(e)}
+        for _ in range(6):
+            time.sleep(0.5)
+            now = next((p for p in self.positions() if p["symbol"] == symbol), None)
+            if now is None or now["qty"] < pos["qty"] - inst.qty_step / 2:
+                left = now["qty"] if now else 0.0
+                return {"ok": True, "qty": round(pos["qty"] - left, 8), "left": left,
+                        "raw": "reduced"}
+        return {"ok": False, "qty": 0.0, "raw": "reduce order sent but size unchanged"}
 
     # ------------------------------------------------------------------ health
     def ping(self) -> dict:

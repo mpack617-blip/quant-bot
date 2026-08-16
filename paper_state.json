@@ -1,8 +1,10 @@
 {
-  "_note": "Seed state only. The runner rewrites this file every tick; the copy in git is what a fresh deploy starts from (Render's free disk is ephemeral). It deliberately carries NO 'bybit_real_start': that key anchors the notional book, and a stale anchor makes a fresh $X book start at $X plus months of unrelated PnL. With it absent the book anchors to the live exchange balance at boot, so it starts at exactly QUANT_CAPITAL.",
+  "_note": "Seed state only. The runner rewrites this file every tick; the copy in git is what a fresh deploy starts from (Render's free disk is ephemeral). It deliberately carries NO 'bybit_real_start': that key anchored the book to a BALANCE, and a balance re-read after a restart made the book snap back to exactly QUANT_CAPITAL, erasing every trade from the equity. 'book_start_ms' replaces it: a timestamp cannot go stale, because the PnL since it is re-read from Bybit's own closed-trade records on every tick. Override with the QUANT_BOOK_START env var.",
+  "_book_start_note": "1785974400000 = 2026-08-06T00:00:00Z, the day this $100 book took its first trade.",
   "mode": "bybit",
   "equity": 100.0,
   "start_equity": 100.0,
+  "book_start_ms": 1785974400000,
   "open_positions": [],
   "running": false
 }

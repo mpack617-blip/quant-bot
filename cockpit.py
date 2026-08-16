@@ -108,10 +108,36 @@ def logout():
     return redirect(url_for("login"))
 
 
+def _build_id() -> str:
+    """Which commit is actually serving, for the health probe.
+
+    Render deploys with zero downtime — the old instance keeps answering until the
+    new one is healthy — so watching /healthz through a deploy shows an unbroken run
+    of 200s whether the new code went live or the deploy never fired at all. Without
+    a marker here the only way to tell is the Render dashboard, behind a login. Render
+    sets RENDER_GIT_COMMIT; locally we ask git, and if neither answers we say so
+    rather than guessing.
+    """
+    sha = os.environ.get("RENDER_GIT_COMMIT")
+    if not sha:
+        try:
+            import subprocess
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                                 text=True, timeout=5, cwd=os.path.dirname(__file__)
+                                 ).stdout.strip()
+        except Exception:  # noqa: BLE001
+            sha = ""
+    return sha[:7] if sha else "unknown"
+
+
+BUILD = _build_id()
+
+
 @app.route("/healthz")
 def healthz():
-    """Unauthenticated liveness probe — deliberately exposes nothing but a flag."""
-    return jsonify({"ok": True, "running": RUNNER.running})
+    """Unauthenticated liveness probe. Exposes a liveness flag and the build it is
+    running — no account, position or market data."""
+    return jsonify({"ok": True, "running": RUNNER.running, "build": BUILD})
 
 
 def _auth(req) -> tuple[bool, str]:
@@ -161,6 +187,14 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div id="pnl">--</div><div style="color:#8b949e" id="dd">--</div></div>
  <div class="card"><h2>All-time stats</h2><div id="stats">--</div>
    <div style="margin-top:8px;color:#8b949e" id="senti">--</div></div>
+ <div class="card"><h2>📅 Aaj ka din</h2><div class="big" id="todayline">--</div>
+   <div id="budget" style="margin-top:6px">--</div>
+   <div style="color:#8b949e;font-size:12px;margin-top:8px" id="rules">--</div></div>
+ <div class="card"><h2>🗓️ Din-ba-din record</h2>
+   <table id="days"><thead><tr><th>Date</th><th>W</th><th>L</th><th>Net</th></tr></thead><tbody></tbody></table>
+   <div style="color:#8b949e;font-size:11px;margin-top:6px">
+     Loss budget khatam hone ke baad us din koi nayi trade nahi. Breakeven pe closed trade
+     loss nahi ginti — wahi partial + BE stop ka poora point hai.</div></div>
  <div class="card full"><h2>🔮 Next move — the bot's forward read</h2>
    <div style="color:#8b949e;font-size:11px;margin-bottom:8px" id="fcnote">
      Probabilities, not predictions. Measured out-of-sample: 52.3% directional accuracy,
@@ -204,7 +238,11 @@ async function refresh(){
  rstate.className='pill '+(s.running?'on':'off');
  toggle.textContent=s.running?'STOP':'START';toggle.className=s.running?'stop':'start';
  equity.textContent='$'+(s.equity||0).toFixed(2);
- let p=s.pnl||0;pnl.innerHTML='PnL: <b class="'+(p>=0?'green':'red')+'">$'+p.toFixed(2)+'</b>';
+ let p=s.pnl||0;pnl.innerHTML='PnL: <b class="'+(p>=0?'green':'red')+'">$'+p.toFixed(2)+'</b>'+
+   ' <span style="font-size:11px;color:#8b949e">(start $'+(s.start_equity||0).toFixed(2)+
+   ' &middot; banked $'+(s.realised_pnl||0).toFixed(2)+
+   ' &middot; open $'+(s.unrealised_pnl||0).toFixed(2)+')</span>'+
+   (s.book_synced===false?' <span class="red" style="font-size:11px">exchange sync failed — figure may be stale</span>':'');
  dd.textContent='Daily DD: '+(s.daily_dd_pct||0)+'%'+(s.halted?' — HALTED':'');
  if(s.trading_capital){
    // Two different numbers, both true: the book the bot sizes against, and what the
@@ -215,6 +253,25 @@ async function refresh(){
  let st=s.stats||{};let lr=s.learning||{};
  stats.innerHTML='Trades '+st.trades+' &middot; Win '+st.win_rate_pct+'% &middot; PF '+st.profit_factor+' &middot; Net $'+st.net_pnl+
    '<br><span style="color:#3fb950">🧠 Learning: '+(lr.live_trades_logged||0)+' trades logged, '+(lr.lessons_count||0)+' lessons</span>';
+ // --- today's scoreboard + the loss budget left ---
+ let td=s.today||{},pbk=s.playbook||{};
+ todayline.innerHTML='<span class="green">'+(td.wins||0)+'W</span> / <span class="red">'+
+   (td.losses||0)+'L</span>'+((td.scratches||0)?' <span style="color:#8b949e">/ '+td.scratches+' BE</span>':'')+
+   ' <span style="font-size:14px;color:#8b949e">&middot; net </span><span class="'+((td.net_pnl||0)>=0?'green':'red')+
+   '" style="font-size:20px">$'+(td.net_pnl||0).toFixed(2)+'</span>';
+ let left=Math.max(0,(pbk.max_daily_losses||0)-(td.losses||0));
+ budget.innerHTML=pbk.blocked
+   ? '<b class="red">NEW TRADES OFF</b> — '+pbk.block_reason
+   : '<b class="green">Trading</b> — loss budget: '+left+' of '+pbk.max_daily_losses+' left today';
+ rules.innerHTML='Rules: EV &ge; '+pbk.ev_min+' &middot; stop &ge; '+
+   ((pbk.min_stop_pct||0)*100).toFixed(2)+'% &middot; HTF trend ke saath &middot; ATR percentile &ge; '+
+   pbk.min_atr_pctile+' &middot; '+(pbk.session_skip_utc||[]).length+' late hours skip<br>'+
+   'Trade management: '+pbk.partial+' &middot; loss ke baad '+pbk.cooldown_h+'h cooldown';
+ let dyb=document.querySelector('#days tbody');dyb.innerHTML='';
+ (s.days||[]).forEach(d=>{dyb.innerHTML+='<tr><td>'+d.date.slice(5)+'</td><td class="green">'+d.wins+
+   '</td><td class="'+(d.losses>1?'red':'')+'">'+d.losses+'</td><td class="'+(d.net_pnl>=0?'green':'red')+
+   '">$'+d.net_pnl.toFixed(2)+'</td></tr>'});
+ if(!(s.days||[]).length)dyb.innerHTML='<tr><td colspan=4>Abhi tak koi closed trade nahi.</td></tr>';
  let ex=s.exchange||{};let mt=document.getElementById('modetag');
  if(s.mode=='bybit'){
    let env=(ex.env||'?').toUpperCase();
@@ -381,12 +438,21 @@ def status():
         "running": RUNNER.running,
         "mode": RUNNER.mode,
         "equity": round(RUNNER.equity, 2),
-        "start_equity": RUNNER.risk.start_equity,
-        "pnl": round(RUNNER.equity - RUNNER.risk.start_equity, 2),
+        # PnL is measured from where the BOOK started ($100), not from the equity the
+        # risk manager happened to be constructed with — that is the equity at the
+        # last restart, which made a losing account report a PnL of exactly $0.00.
+        "start_equity": round(RUNNER.start_equity, 2),
+        "pnl": round(RUNNER.equity - RUNNER.start_equity, 2),
+        "realised_pnl": round(getattr(RUNNER, "_realised", 0.0), 2),
+        "unrealised_pnl": round(getattr(RUNNER, "_unrealised", 0.0), 2),
+        "book_synced": getattr(RUNNER, "_book_synced", None),
         "daily_dd_pct": RUNNER.risk.daily_drawdown_pct(),
         "halted": RUNNER.risk.halted,
         "open_positions": journal.open_positions(),
         "stats": journal.stats(),
+        "today": journal.day_summary(),
+        "days": journal.daily_history(14),
+        "playbook": _playbook_status(),
         "lessons": journal.lessons(6),
         "market_sentiment": _senti(),
         "watching": RUNNER.watching[:12],
@@ -418,6 +484,27 @@ def tv_chart():
     return send_file(shot, mimetype="image/png")
 
 
+def _playbook_status():
+    """The rules the bot is trading under right now, and whether the day is still
+    open. Shown on the dashboard so 'why isn't it trading?' has a visible answer."""
+    import playbook
+    import runner as R
+    blocked, reason = RUNNER.dayguard.blocks()
+    return {
+        "max_daily_losses": playbook.MAX_DAILY_LOSSES,
+        "cooldown_h": playbook.LOSS_COOLDOWN_H,
+        "blocked": blocked,
+        "block_reason": reason,
+        "ev_min": R.EV_MIN,
+        "min_stop_pct": playbook.MIN_STOP_PCT,
+        "min_atr_pctile": playbook.MIN_ATR_PCTILE,
+        "htf_align": playbook.REQUIRE_HTF_ALIGN,
+        "session_skip_utc": list(playbook.SKIP_HOURS_UTC),
+        "partial": (f"{R.PARTIAL_FRAC:.0%} banked at +{R.PARTIAL_AT_R}R, stop to breakeven"
+                    if R.USE_PARTIAL else "off"),
+    }
+
+
 def _capital():
     """What the bot sizes against: the configured notional book, or — when it runs
     the whole account — the live balance itself."""
@@ -446,7 +533,9 @@ def _headlines():
 
 @app.route("/api/trades")
 def trades():
-    return jsonify(journal.recent_trades(40))
+    # 100, not 40: the history is now rebuilt from the exchange on every boot, so it
+    # is the account's whole record rather than whatever survived the last restart.
+    return jsonify(journal.recent_trades(100))
 
 
 @app.route("/api/start", methods=["POST"])

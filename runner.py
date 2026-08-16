@@ -36,6 +36,7 @@ import news
 import journal
 import market
 import conviction
+import playbook
 from risk import RiskManager
 
 STATE_PATH = config.ROOT / "paper_state.json"
@@ -76,6 +77,17 @@ RANGE_PARAMS = dict(adx_max=18.0, atr_stop=1.2, min_rr=0.6, min_stretch=0.3, wic
 USE_TRAIL = True        # trailing stop ON (user 2026-06-12): once a trade is +1R, stop moves to
                         # breakeven then trails by ATR — locks profit, lets winners run, turns
                         # would-be losers into break-even. The conviction target is the ceiling.
+                        # Measured neutral (±0.002R) once the partial below is in place; kept
+                        # because it costs nothing and protects a runner that stalls short of
+                        # its target.
+# --- PARTIAL TAKE-PROFIT: bank a slice early, then risk nothing ---
+# See the long note in _manage for the measurements. Short version: a third off at
+# +0.5R with the stop to breakeven takes the win rate from 32% to 70% on identical
+# entries, at the same expectancy — and it is the change that turns "three losses
+# today" into "one loss and two small wins".
+USE_PARTIAL = os.environ.get("QUANT_PARTIAL", "1") != "0"
+PARTIAL_AT_R = float(os.environ.get("QUANT_PARTIAL_R", "0.5"))
+PARTIAL_FRAC = float(os.environ.get("QUANT_PARTIAL_FRAC", "0.34"))
 # THE ENTRY GATE — expected value, not win probability (2026-08-10).
 #
 # The old gate was `P(win) >= 0.60`, chosen from a walk-forward that reported 55%
@@ -102,9 +114,17 @@ USE_TRAIL = True        # trailing stop ON (user 2026-06-12): once a trade is +1
 #
 # Why EV beats a probability threshold: a 40% shot paying 3:1 is a better trade than
 # a 55% shot paying 1:1, and a flat P(win) cut cannot tell them apart — it discards
-# exactly the trades whose payoff covers the losers. Expect a LOWER win-rate than
-# the old gate claimed (~43%) and a positive expectancy, which is what compounds.
-EV_MIN = 0.25
+# exactly the trades whose payoff covers the losers.
+#
+# RAISED 0.25 -> 0.40 (2026-08-16). The 0.25 figure above was measured on the gate
+# ALONE, with every signal taken and held to its target. Re-measured with the whole
+# stack that now runs — the playbook's quality filters, a third of the position
+# banked at +0.5R, and the daily loss budget — the marginal trades between EV 0.25
+# and 0.40 are the ones that bleed: raising the gate lifts expectancy from +0.269R
+# to +0.321R a trade and the win rate from 78% to 80%, in both halves of the period
+# (+0.379 / +0.257). It costs frequency (1.7 -> 1.2 trades a day from this
+# timeframe), which is the trade the operator asked for. See research_manage.py.
+EV_MIN = float(os.environ.get("QUANT_EV_MIN", "0.40"))
 ML_MIN_PROB = 0.0       # superseded by EV_MIN; kept so old configs don't break
 # Sanity bounds on a setup that has aged since it fired (see _score). Not tuned for
 # edge — a stop-distance floor WAS tested as a filter and helped one half of the
@@ -223,6 +243,30 @@ _saved = _saved_capital()
 if _saved != "__none__":
     BYBIT_CAPITAL = None if _saved in (None, "full") else float(_saved)
 
+# WHEN THIS BOOK STARTED — the anchor the $100 account's PnL is measured from.
+#
+# The old anchor was a BALANCE (`bybit_real_start`): the exchange balance seen at
+# boot, with book equity = capital + (balance now - balance then). On a host whose
+# disk is ephemeral that is re-read as "the balance right now" after every restart,
+# so the book snapped back to exactly $100 and every trade the bot had ever taken
+# vanished from the equity. That is the "balance still says $100" bug.
+#
+# A TIMESTAMP cannot go stale the same way. Book equity is recomputed from the
+# exchange each tick as:
+#       capital + realised PnL since the anchor + unrealised PnL now
+# so after any restart, redeploy or wiped disk the number rebuilds itself from
+# Bybit's own records. Set QUANT_BOOK_START (ISO date or epoch ms) to move it.
+BOOK_START_ENV = os.environ.get("QUANT_BOOK_START", "").strip()
+
+# A closed trade whose position was this many times the book cannot have come FROM
+# the book. The same demo account ran in full-account mode before the $100 cap
+# existed, and it left four positions of $34k-$81k notional behind (2026-08-10).
+# Summing those into a $100 book's PnL would have read -$1,057 of "equity". With
+# 5x leverage and 8 concurrent positions the book's own worst-case exposure is 5x
+# capital, so 50x is far outside anything it can produce — this rejects the other
+# regime's trades without ever touching one of its own.
+FOREIGN_NOTIONAL_X = 50
+
 BYBIT_RISK = {
     "max_risk_per_trade_pct": 4.0,
     # Raised 3 -> 8 alongside the 24 -> 59 coin universe: with more markets scanned,
@@ -304,6 +348,12 @@ class QuantRunner:
             bb_eq = self.ex.equity()
             self.real_equity = bb_eq if bb_eq else 0.0
             self._real_start = self._load_real_start(self.real_equity)
+            self.book_start_ms = self._load_book_start()
+            self._realised = 0.0     # PnL banked since the anchor (refreshed from Bybit)
+            self._unrealised = 0.0   # open-position PnL right now
+            self._book_synced = False   # has the exchange confirmed those two numbers?
+            self.activity_log = []      # _sync_book reports into it, before the block below
+            self._sync_book(boot=True)
             self.equity = self._book_equity()
             self.risk = RiskManager(self.equity, BYBIT_RISK)
         else:
@@ -317,12 +367,19 @@ class QuantRunner:
         # capital, or (running the whole account) the balance we first saw.
         self.start_equity = ((BYBIT_CAPITAL if BYBIT_CAPITAL is not None else self._real_start)
                              if mode == "bybit" else self._load_start_equity(self.equity))
+        # The day's loss budget and cooldown. Stateless by design — it reads the
+        # journal every time it is asked, so a restart mid-session cannot hand the
+        # bot a fresh budget after it has already lost twice today.
+        self.dayguard = playbook.DayGuard()
+        self._day_block: tuple[bool, str] = (False, "")   # refreshed once per tick
         self.running = False
         self._thread: threading.Thread | None = None
         self.last_tick = None
         self.last_note = f"idle ({mode})"
         self.watching: list[dict] = []      # what the bot is looking at right now
-        self.activity_log: list[str] = []   # rolling feed of what it's doing (newest last)
+        # Rolling feed of what it's doing (newest last). NOT reset to [] here: the
+        # Bybit branch above already reports the history it recovered on boot into it.
+        self.activity_log: list[str] = getattr(self, "activity_log", [])
         self.scans = 0                      # how many full market scans done
         self.tv_view: dict = {}             # the live TradingView chart the bot is driving
         self.mkt_bias = 0                   # BTC market-regime gate (+1 up / -1 down / 0 neutral)
@@ -354,18 +411,106 @@ class QuantRunner:
                 pass
         return current
 
+    def _load_book_start(self) -> int:
+        """Epoch-ms the notional book started at. Env wins (it survives a wiped disk),
+        then the state file, then 'now' for a book that has genuinely just begun."""
+        if BOOK_START_ENV:
+            try:
+                if BOOK_START_ENV.isdigit():
+                    return int(BOOK_START_ENV)
+                iso = BOOK_START_ENV.replace("Z", "+00:00")
+                return int(datetime.fromisoformat(iso).timestamp() * 1000)
+            except Exception:  # noqa: BLE001
+                _log(f"[book] could not read QUANT_BOOK_START={BOOK_START_ENV!r} — ignoring")
+        if STATE_PATH.exists():
+            try:
+                v = json.loads(STATE_PATH.read_text()).get("book_start_ms")
+                if v:
+                    return int(v)
+            except Exception:  # noqa: BLE001
+                pass
+        return int(time.time() * 1000)
+
+    @staticmethod
+    def _book_trades(closed: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Split the exchange's closed trades into this book's and everything else.
+
+        Only meaningful when the bot trades a notional book (QUANT_CAPITAL is a
+        number); running the whole account, every trade on it is the account's.
+        """
+        if BYBIT_CAPITAL is None:
+            return closed, []
+        limit = FOREIGN_NOTIONAL_X * BYBIT_CAPITAL
+        mine = [r for r in closed if abs(r["entry"] * r["qty"]) <= limit]
+        return mine, [r for r in closed if abs(r["entry"] * r["qty"]) > limit]
+
+    def _sync_book(self, boot: bool = False) -> None:
+        """Re-read the book's PnL — and its trade history — from the EXCHANGE.
+
+        This is the single place that makes the dashboard honest on a host with an
+        ephemeral disk. Bybit keeps every closed trade; we ask it for everything since
+        the anchor, sum the realised PnL (that is the book's equity), and refill
+        journal.db with any trade the local file has lost. Both come from one walk of
+        the same endpoint, so it costs one paginated read per tick.
+        """
+        if self.mode != "bybit" or self.ex is None:
+            return
+        if not self.exchange_info.get("authenticated"):
+            return
+        try:
+            closed = self.ex.closed_pnl_since(self.book_start_ms)
+        except Exception as e:  # noqa: BLE001
+            _log(f"[book] closed-pnl read failed, keeping last figures: {e}")
+            return
+        closed, foreign = self._book_trades(closed)
+        exch_realised = round(sum(r["pnl"] for r in closed), 6)
+        self._unrealised = self.ex.unrealised()
+        self._book_synced = True
+        if foreign and boot:
+            _log(f"[book] ignored {len(foreign)} trade(s) too large to be this book's "
+                 f"(${sum(abs(r['pnl']) for r in foreign):,.0f} of PnL from the account's "
+                 f"full-account period)")
+        try:
+            still_open = {p["symbol"] for p in journal.open_positions()}
+            added = journal.import_exchange_trades(closed, skip_symbols=still_open)
+        except Exception as e:  # noqa: BLE001
+            _log(f"[book] history import failed: {e}")
+            added = 0
+        if added:
+            msg = (f"RECOVERED {added} past trade(s) from Bybit — the local journal had "
+                   f"been wiped (ephemeral disk). History and balance are rebuilt from "
+                   f"the exchange.")
+            _log(msg)
+            self._activity(msg)
+        # Realised PnL is read back OUT of the journal, not from the sum above, so the
+        # equity and the trade table can never tell the user two different stories.
+        # The journal was just refilled from the exchange, so it holds those trades
+        # plus any the exchange has already aged out of its own closed-PnL window
+        # (Bybit's demo history is short — it had already dropped this book's first
+        # two trades). The exchange sum is the fallback if the journal is empty.
+        self._realised = journal.realised_since(self.book_start_ms) or exch_realised
+        if boot:
+            anchor = datetime.fromtimestamp(self.book_start_ms / 1000, timezone.utc)
+            _log(f"[book] anchored {anchor.isoformat(timespec='minutes')} | "
+                 f"{len(closed)} closed trades since | realised ${self._realised:+.2f} "
+                 f"| unrealised ${self._unrealised:+.2f}")
+
     def _book_equity(self) -> float:
         """The account the bot sizes against.
 
         BYBIT_CAPITAL is None -> the bot runs the WHOLE account: book equity IS the
         exchange balance. This is the normal mode.
 
-        BYBIT_CAPITAL set -> a notional book of that size that starts there and then
-        moves one-for-one with the account's real PnL. Used to rehearse a small account
-        on a large demo balance; the exchange balance stays the untouched truth.
+        BYBIT_CAPITAL set -> a notional book of that size, whose PnL is the account's
+        REALISED PnL since the anchor plus what is open right now. Rebuilt from the
+        exchange every tick, so a restart cannot reset it to the starting figure — the
+        bug that made the dashboard read a flat $100 no matter what the bot had done.
         """
         if BYBIT_CAPITAL is None:
             return round(self.real_equity, 4)
+        if self.mode == "bybit" and getattr(self, "_book_synced", False):
+            return round(BYBIT_CAPITAL + self._realised + self._unrealised, 4)
+        # Fallback for an unauthenticated/offline start: the old balance-delta anchor.
         return round(BYBIT_CAPITAL + (self.real_equity - self._real_start), 4)
 
     def _load_start_equity(self, default: float) -> float:
@@ -420,6 +565,26 @@ class QuantRunner:
             "manages_full_account": self.mode == "bybit" and BYBIT_CAPITAL is None,
             "real_balance": round(self.real_equity, 2) if self.mode == "bybit" else None,
             "bybit_real_start": self._real_start if self.mode == "bybit" else None,
+            # The book's PnL, split into what is banked and what is still open, both
+            # re-read from Bybit every tick. `book_start_ms` is the anchor they are
+            # measured from and is what has to survive a restart — not the equity.
+            "book_start_ms": getattr(self, "book_start_ms", None) if self.mode == "bybit" else None,
+            "realised_pnl": round(getattr(self, "_realised", 0.0), 2) if self.mode == "bybit" else None,
+            "unrealised_pnl": round(getattr(self, "_unrealised", 0.0), 2) if self.mode == "bybit" else None,
+            "book_synced": getattr(self, "_book_synced", False) if self.mode == "bybit" else None,
+            "today": journal.day_summary(),
+            "days": journal.daily_history(14),
+            "playbook": {
+                "max_daily_losses": playbook.MAX_DAILY_LOSSES,
+                "cooldown_h": playbook.LOSS_COOLDOWN_H,
+                "blocked": self._day_block[0],
+                "block_reason": self._day_block[1],
+                "ev_min": EV_MIN,
+                "min_stop_pct": playbook.MIN_STOP_PCT,
+                "min_atr_pctile": playbook.MIN_ATR_PCTILE,
+                "partial": f"{PARTIAL_FRAC:.0%} at +{PARTIAL_AT_R}R" if USE_PARTIAL else "off",
+                "session_skip_utc": list(playbook.SKIP_HOURS_UTC),
+            },
         }
         if self.mode == "bybit":
             # Written on EVERY tick, not just when it changes: this file is rewritten
@@ -471,6 +636,7 @@ class QuantRunner:
                 fill = exit_price
                 if self.mode == "bybit":
                     self.real_equity = eq_after
+                    self._sync_book()      # the close just changed realised PnL
                     self.equity = self._book_equity()
                 else:
                     self.equity = eq_after
@@ -489,6 +655,29 @@ class QuantRunner:
             _log(note)
             return
 
+        # --- bank a third at +0.5R, then make the trade free ---
+        # THE SINGLE BIGGEST CHANGE TO HOW OFTEN THIS BOT LOSES. Holding every trade
+        # whole to a 2R target means the market has to be right about the setup twice
+        # over; taking a slice at +0.5R and pulling the stop to breakeven means it only
+        # has to be right once, and the trade that then reverses costs nothing instead
+        # of a full R. Measured over 197 days on walk-forward-gated signals
+        # (research_manage.py), on the same entries:
+        #     hold to target, stop at BE after 1R (what ran before)   32% win  +0.063R
+        #     bank 1/2 at +1R, stop to BE                             55% win  +0.055R
+        #     bank 1/3 at +0.5R, stop to BE   <- this                 70% win  +0.062R
+        # and with the daily loss budget on top, that last line is 80% win / +0.321R.
+        # A third, not a half: banking half caps the winners hard enough to cost
+        # +0.05R a trade (+0.185 vs +0.217 in the same test), and two thirds is worse
+        # again (+0.153). Trailing the remainder and time-stopping it were both tested
+        # here and are worth nothing either way (±0.002R), so the runner is left alone
+        # to reach the target the model was scored against.
+        risk_unit = abs(pos["entry"] - pos["stop"])
+        move = (price - pos["entry"]) * side
+        if (USE_PARTIAL and risk_unit and not pos.get("partial")
+                and move >= PARTIAL_AT_R * risk_unit and pos["qty"]):
+            self._take_partial(sym, pos, price, risk_unit)
+            return
+
         # --- trailing stop ---  (only ONCE the trade is solidly in profit)
         # Until +BE_AFTER_R the original stop holds (don't choke a fresh trade). After
         # that: lock breakeven, then trail TRAIL_ATR_MULT ATRs behind price. The stop is
@@ -496,8 +685,6 @@ class QuantRunner:
         # a would-be loser into break-even and lets a runner keep running.
         if not USE_TRAIL:
             return
-        move = (price - pos["entry"]) * side
-        risk_unit = abs(pos["entry"] - pos["stop"])
         if not risk_unit or move < BE_AFTER_R * risk_unit:
             return
         new_stop = pos["entry"]                                  # breakeven floor
@@ -516,6 +703,58 @@ class QuantRunner:
             with journal._conn() as c:
                 c.execute("UPDATE positions SET stop=? WHERE symbol=?", (new_stop, sym))
             self._activity(f"TRAIL {sym} stop -> {new_stop:.4f} (locking profit)")
+
+    def _take_partial(self, sym: str, pos: dict, price: float, risk_unit: float) -> None:
+        """Sell PARTIAL_FRAC of the position at +PARTIAL_AT_R and pull the stop to
+        breakeven, so what is left cannot turn into a loss.
+
+        Order matters: the slice is sold FIRST and the stop moved after. If the stop
+        move fails, the bot still banked the profit and the trade keeps its original
+        (valid) stop — the reverse order could leave the exchange protecting a
+        quantity that no longer exists.
+        """
+        side = pos["side"]
+        want = pos["qty"] * PARTIAL_FRAC
+        fill, closed_qty = price, want
+        if self.mode == "bybit" and self.ex is not None:
+            res = self.ex.reduce(sym, want)
+            if not res["ok"]:
+                # Almost always the exchange's minimum order size on a small book:
+                # a third of a $60 position can be below it. Not an error — the trade
+                # simply runs whole, and the breakeven stop below still protects it.
+                self._activity(f"PARTIAL {sym.replace('USDT','')} skipped - {res['raw']}")
+                with journal._conn() as c:
+                    c.execute("UPDATE positions SET partial=1 WHERE symbol=?", (sym,))
+                self._move_stop_to_be(sym, pos)
+                return
+            closed_qty = res["qty"] or want
+            fill = self.ex.last_price(sym) or price
+        pnl = (fill - pos["entry"]) * closed_qty * side
+        r = pnl / (risk_unit * closed_qty) if closed_qty and risk_unit else None
+        journal.record_partial(sym, fill, closed_qty, round(pnl, 4),
+                               round(r, 2) if r is not None else None,
+                               f"partial +{PARTIAL_AT_R}R ({PARTIAL_FRAC:.0%} banked)")
+        self._move_stop_to_be(sym, pos)
+        note = (f"PARTIAL {sym.replace('USDT','')} banked {PARTIAL_FRAC:.0%} at "
+                f"{fill:.4f} (+${pnl:.2f}) - stop to breakeven, rest runs free")
+        self.last_note = note
+        self._activity(note)
+        _log(note)
+
+    def _move_stop_to_be(self, sym: str, pos: dict) -> None:
+        """Breakeven stop on the remainder. On Bybit the stop lives on the exchange,
+        so it is moved there first; the journal only follows a move that landed."""
+        be = pos["entry"]
+        improved = (be > pos["stop"]) if pos["side"] == 1 else (be < pos["stop"])
+        if not improved:
+            return
+        if self.mode == "bybit" and self.ex is not None:
+            if not self.ex.set_stops(sym, stop=be):
+                self._activity(f"BE {sym.replace('USDT','')} - exchange stop move failed, "
+                               f"keeping {pos['stop']:.4f}")
+                return
+        with journal._conn() as c:
+            c.execute("UPDATE positions SET stop=? WHERE symbol=?", (be, sym))
 
     # ---- the chart the bot is reading ----
     def _build_chart(self, plans: list[dict], watching: list[dict]) -> None:
@@ -791,9 +1030,11 @@ class QuantRunner:
                 pnl, exit_px, why = 0.0, pos["entry"], "closed on exchange (pnl unknown)"
             risk_unit = abs(pos["entry"] - pos["stop"]) * pos["qty"]
             r = pnl / risk_unit if risk_unit else None
+            ext = f"{sym}:{realised[0]['closed_ms']}" if realised else None
             rec = journal.record_close(sym, exit_px, round(pnl, 4),
-                                       round(r, 2) if r else None, why)
+                                       round(r, 2) if r else None, why, ext_id=ext)
             self.real_equity = self.ex.equity() or self.real_equity
+            self._sync_book()
             self.equity = self._book_equity()
             self.risk.update_equity(self.equity)
             note = f"SYNC {sym} closed on Bybit ({why}) pnl ${pnl:+.2f} -> eq ${self.equity:.2f}"
@@ -896,6 +1137,20 @@ class QuantRunner:
         # context, which is what the loss post-mortems and the next ML retrain read.
         feat_row = dict(self._last_row)
         if ev < EV_MIN:
+            return
+
+        # THE PLAYBOOK. Two gates the EV model cannot see: whether this SETUP is one
+        # of the structurally poor kinds (stop inside the noise, against the higher
+        # timeframe, dead volatility, dead session), and whether the DAY has already
+        # spent its loss budget. Both were measured on 197 days of walk-forward-gated
+        # signals — see playbook.py for the numbers behind each one.
+        veto = playbook.entry_veto(entry=price, stop=sig.stop, side=sig.side, ctx=feat_row)
+        if veto:
+            self._activity(f"SKIP {sym.replace('USDT','')} - {veto}")
+            return
+        # Announced once per tick in tick(), not once per coin — 59 identical lines
+        # would bury everything else on the activity feed.
+        if self._day_block[0]:
             return
         ok_news, news_reason = news.agrees_with(sym, sig.side)
         if not ok_news or sentiment.risk_off:
@@ -1092,11 +1347,17 @@ class QuantRunner:
             if eq:
                 if self.mode == "bybit":
                     self.real_equity = eq
+                    self._sync_book()      # realised + unrealised, straight from Bybit
                     self.equity = self._book_equity()
                 else:
                     self.equity = eq
         self._reconcile()            # exchange is the source of truth (bybit mode)
         self.risk.update_equity(self.equity)
+        # The day's loss budget — evaluated once, after reconciliation has booked
+        # anything the exchange closed while this process was between ticks.
+        self._day_block = self.dayguard.blocks()
+        if self._day_block[0]:
+            self._activity(f"NO NEW TRADES - {self._day_block[1]}")
         sentiment = news.market_sentiment()
         self.mkt_bias = market.current_bias(DECISION_INTERVAL)   # don't fight BTC's trend
         # BTC candles once per tick: every coin's context features are measured
